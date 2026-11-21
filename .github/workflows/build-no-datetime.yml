@@ -152,8 +152,8 @@ jobs:
                   raise RuntimeError("Could not locate groupMedia() in MediaFetcher.kt")
               param_media, param_path = m.group(1), m.group(2)
               guard = (
-                  f"\n        val currentGrouping = context.config.getFolderGrouping({param_path})\n"
-                  f"        if ((currentGrouping and (GROUP_BY_DATE_TAKEN_DAILY or GROUP_BY_DATE_TAKEN_MONTHLY "
+                  f"\n        val noDateGrouping = context.config.getFolderGrouping({param_path})\n"
+                  f"        if ((noDateGrouping and (GROUP_BY_DATE_TAKEN_DAILY or GROUP_BY_DATE_TAKEN_MONTHLY "
                   f"or GROUP_BY_LAST_MODIFIED_DAILY or GROUP_BY_LAST_MODIFIED_MONTHLY)) != 0) {{\n"
                   f"            return ArrayList({param_media})\n"
                   f"        }}\n"
