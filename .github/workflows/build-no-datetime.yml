@@ -46,10 +46,19 @@ jobs:
           import android.view.View
           import android.view.ViewGroup
           import android.widget.TextView
+          import org.fossify.commons.dialogs.BasePropertiesDialog
           import org.fossify.commons.dialogs.PropertiesDialog
 
           fun PropertiesDialog.stripDateRows(): PropertiesDialog {
-              val context = mPropertyView.context
+              val propertyView = try {
+                  val field = BasePropertiesDialog::class.java.getDeclaredField("mPropertyView")
+                  field.isAccessible = true
+                  field.get(this) as? ViewGroup
+              } catch (_: Throwable) {
+                  null
+              } ?: return this
+
+              val context = propertyView.context
               val blockedLabels = setOf(
                   context.getString(org.fossify.commons.R.string.last_modified),
                   context.getString(org.fossify.commons.R.string.date_taken),
@@ -63,10 +72,10 @@ jobs:
                   }
               }
 
-              for (i in 0 until mPropertyView.childCount) {
-                  hideIfDateRow(mPropertyView.getChildAt(i))
+              for (i in 0 until propertyView.childCount) {
+                  hideIfDateRow(propertyView.getChildAt(i))
               }
-              mPropertyView.setOnHierarchyChangeListener(object : ViewGroup.OnHierarchyChangeListener {
+              propertyView.setOnHierarchyChangeListener(object : ViewGroup.OnHierarchyChangeListener {
                   override fun onChildViewAdded(parent: View?, child: View?) {
                       hideIfDateRow(child)
                   }
@@ -135,14 +144,18 @@ jobs:
           def patch_media_fetcher() -> None:
               path = ROOT / "helpers/MediaFetcher.kt"
               code = read_file(path)
-              m = re.search(r"fun\s+groupMedia\s*\(\s*(\w+)\s*:[^)]*\)[^{]*\{", code)
+              m = re.search(
+                  r"fun\s+groupMedia\s*\(\s*(\w+)\s*:[^,]+,\s*(\w+)\s*:[^)]*\)[^{]*\{",
+                  code,
+              )
               if not m:
                   raise RuntimeError("Could not locate groupMedia() in MediaFetcher.kt")
-              param = m.group(1)
+              param_media, param_path = m.group(1), m.group(2)
               guard = (
-                  f"\n        if (groupBy and (GROUP_BY_DATE_TAKEN_DAILY or GROUP_BY_DATE_TAKEN_MONTHLY "
-                  f"or GROUP_BY_LAST_MODIFIED_DAILY or GROUP_BY_LAST_MODIFIED_MONTHLY) != 0) {{\n"
-                  f"            return ArrayList({param})\n"
+                  f"\n        val currentGrouping = context.config.getFolderGrouping({param_path})\n"
+                  f"        if ((currentGrouping and (GROUP_BY_DATE_TAKEN_DAILY or GROUP_BY_DATE_TAKEN_MONTHLY "
+                  f"or GROUP_BY_LAST_MODIFIED_DAILY or GROUP_BY_LAST_MODIFIED_MONTHLY)) != 0) {{\n"
+                  f"            return ArrayList({param_media})\n"
                   f"        }}\n"
               )
               code = code[:m.end()] + guard + code[m.end():]
