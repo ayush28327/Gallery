@@ -643,44 +643,48 @@ jobs:
               if total == 0:
                   raise RuntimeError("No PropertiesDialog() calls found to wrap")
 
-          def inject_menu_hook(path: pathlib.Path, menu_id: int, title: str, action_kotlin: str) -> None:
+          def inject_menu_hook(path: pathlib.Path, menu_expr: str, menu_id: int, title: str, action_kotlin: str) -> None:
               code = read_file(path)
-              m = re.search(
-                  r"([ \t]*)([A-Za-z0-9_.()]+)?(\.?)setOnMenuItemClickListener\s*\{(?:\s*(\w+)\s*->)?",
+
+              setup_match = re.search(r"fun\s+setupOptionsMenu\s*\(\s*\)\s*\{", code)
+              if not setup_match:
+                  raise RuntimeError(f"Could not locate setupOptionsMenu() in {path}")
+              add_item = (
+                  f'\n        if ({menu_expr}.findItem({menu_id}) == null) {{\n'
+                  f'            {menu_expr}.add(0, {menu_id}, 0, "{title}")\n'
+                  f'        }}\n'
+              )
+              code = code[:setup_match.end()] + add_item + code[setup_match.end():]
+
+              click_match = re.search(
+                  r"setOnMenuItemClickListener\s*\{(?:\s*(\w+)\s*->)?",
                   code,
               )
-              if not m:
+              if not click_match:
                   raise RuntimeError(f"Could not locate setOnMenuItemClickListener in {path}")
-              indent = m.group(1)
-              prefix = m.group(2) or ""
-              menu_expr = f"{prefix}.menu" if prefix else "menu"
-              item_var = m.group(4) or "it"
-
-              add_item = (
-                  f'{indent}if ({menu_expr}.findItem({menu_id}) == null) {{\n'
-                  f'{indent}    {menu_expr}.add(0, {menu_id}, 0, "{title}")\n'
-                  f'{indent}}}\n'
-              )
+              item_var = click_match.group(1) or "it"
               click_handler = (
-                  f'\n{indent}    if ({item_var}.itemId == {menu_id}) {{\n'
-                  f'{indent}        {action_kotlin}\n'
-                  f'{indent}        return@setOnMenuItemClickListener true\n'
-                  f'{indent}    }}\n'
+                  f'\n            if ({item_var}.itemId == {menu_id}) {{\n'
+                  f'                {action_kotlin}\n'
+                  f'                return@setOnMenuItemClickListener true\n'
+                  f'            }}\n'
               )
-              new_code = code[:m.start()] + add_item + code[m.start():m.end()] + click_handler + code[m.end():]
-              new_code = ensure_import(new_code, "import org.fossify.gallery.helpers.VaultManager")
-              write_file(path, new_code)
+              code = code[:click_match.end()] + click_handler + code[click_match.end():]
+              code = ensure_import(code, "import org.fossify.gallery.helpers.VaultManager")
+              write_file(path, code)
               print(f"Injected '{title}' menu hook into {path}")
 
           def patch_vault_menus() -> None:
               inject_menu_hook(
                   ROOT / "activities/MainActivity.kt",
+                  "binding.mainMenu.getToolbar().menu",
                   991001,
                   "Private Vault",
                   "VaultManager.promptAndOpenVault(this)",
               )
               inject_menu_hook(
                   ROOT / "activities/ViewPagerActivity.kt",
+                  "binding.mediumViewerToolbar.menu",
                   991002,
                   "Move to Vault",
                   "getCurrentMedium()?.path?.let { p -> VaultManager.moveToVault(this, p) { finish() } }",
