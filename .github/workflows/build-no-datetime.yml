@@ -1,0 +1,251 @@
+name: Build No-DateTime APK
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Apply No-DateTime patch
+        run: |
+          python3 << 'PYEOF'
+          import pathlib
+          import re
+          import sys
+
+          ROOT = pathlib.Path("app/src/main/kotlin/org/fossify/gallery")
+
+          def read_file(path: pathlib.Path) -> str:
+              try:
+                  return path.read_text(encoding="utf-8")
+              except OSError as exc:
+                  raise RuntimeError(f"Failed to read {path}: {exc}") from exc
+
+          def write_file(path: pathlib.Path, content: str) -> None:
+              try:
+                  path.parent.mkdir(parents=True, exist_ok=True)
+                  path.write_text(content, encoding="utf-8")
+              except OSError as exc:
+                  raise RuntimeError(f"Failed to write {path}: {exc}") from exc
+
+          def create_properties_helper() -> None:
+              helper = ROOT / "helpers/NoDatePropertiesHelper.kt"
+              content = """package org.fossify.gallery.helpers
+
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.TextView
+          import org.fossify.commons.dialogs.PropertiesDialog
+
+          fun PropertiesDialog.stripDateRows(): PropertiesDialog {
+              val context = mPropertyView.context
+              val blockedLabels = setOf(
+                  context.getString(org.fossify.commons.R.string.last_modified),
+                  context.getString(org.fossify.commons.R.string.date_taken),
+              )
+
+              fun hideIfDateRow(child: View?) {
+                  val labelView = child?.findViewById<TextView>(org.fossify.commons.R.id.property_label) ?: return
+                  val label = labelView.text?.toString()?.trim().orEmpty()
+                  if (label in blockedLabels) {
+                      child.visibility = View.GONE
+                  }
+              }
+
+              for (i in 0 until mPropertyView.childCount) {
+                  hideIfDateRow(mPropertyView.getChildAt(i))
+              }
+              mPropertyView.setOnHierarchyChangeListener(object : ViewGroup.OnHierarchyChangeListener {
+                  override fun onChildViewAdded(parent: View?, child: View?) {
+                      hideIfDateRow(child)
+                  }
+
+                  override fun onChildViewRemoved(parent: View?, child: View?) = Unit
+              })
+              return this
+          }
+          """
+              write_file(helper, content)
+              print(f"Created {helper}")
+
+          def replace_balanced_call(code: str, pattern: str, transform) -> tuple[str, int]:
+              out = []
+              idx = 0
+              count = 0
+              for match in re.finditer(pattern, code):
+                  start = match.start()
+                  if start < idx:
+                      continue
+                  open_paren = match.end() - 1
+                  depth = 0
+                  in_str = None
+                  escaped = False
+                  end = open_paren
+                  for pos in range(open_paren, len(code)):
+                      ch = code[pos]
+                      if escaped:
+                          escaped = False
+                          continue
+                      if in_str:
+                          if ch == "\\":
+                              escaped = True
+                          elif ch == in_str:
+                              in_str = None
+                          continue
+                      if ch in ('"', "'"):
+                          in_str = ch
+                      elif ch == "(":
+                          depth += 1
+                      elif ch == ")":
+                          depth -= 1
+                          if depth == 0:
+                              end = pos + 1
+                              break
+                  if depth != 0:
+                      continue
+                  out.append(code[idx:start])
+                  out.append(transform(match, code[start:end]))
+                  idx = end
+                  count += 1
+              out.append(code[idx:])
+              return "".join(out), count
+
+          def ensure_import(code: str, import_line: str) -> str:
+              if import_line in code:
+                  return code
+              return re.sub(
+                  r"(^package\s+[^\n]+\n)",
+                  r"\1\n" + import_line + "\n",
+                  code,
+                  count=1,
+                  flags=re.MULTILINE,
+              )
+
+          def patch_media_fetcher() -> None:
+              path = ROOT / "helpers/MediaFetcher.kt"
+              code = read_file(path)
+              m = re.search(r"fun\s+groupMedia\s*\(\s*(\w+)\s*:[^)]*\)[^{]*\{", code)
+              if not m:
+                  raise RuntimeError("Could not locate groupMedia() in MediaFetcher.kt")
+              param = m.group(1)
+              guard = (
+                  f"\n        if (groupBy and (GROUP_BY_DATE_TAKEN_DAILY or GROUP_BY_DATE_TAKEN_MONTHLY "
+                  f"or GROUP_BY_LAST_MODIFIED_DAILY or GROUP_BY_LAST_MODIFIED_MONTHLY) != 0) {{\n"
+                  f"            return ArrayList({param})\n"
+                  f"        }}\n"
+              )
+              code = code[:m.end()] + guard + code[m.end():]
+              code, fmt_hits = re.subn(
+                  r"(fun\s+formatDate\s*\([^)]*\)[^{]*\{)",
+                  r'\1\n        return ""',
+                  code,
+                  count=1,
+              )
+              write_file(path, code)
+              print(f"Patched {path} (groupMedia guarded, formatDate hits={fmt_hits})")
+
+          def patch_view_pager_fragment() -> None:
+              path = ROOT / "fragments/ViewPagerFragment.kt"
+              code = read_file(path)
+              code, hits = re.subn(r"\b(EXT_DATE_TAKEN|EXT_LAST_MODIFIED)\b", "0", code)
+              if hits == 0:
+                  raise RuntimeError("Could not locate EXT_DATE_TAKEN/EXT_LAST_MODIFIED in ViewPagerFragment.kt")
+              write_file(path, code)
+              print(f"Patched {path} (extended details date flags disabled, hits={hits})")
+
+          def patch_adapters_format_date() -> None:
+              for rel in ("adapters/MediaAdapter.kt", "adapters/DirectoryAdapter.kt"):
+                  path = ROOT / rel
+                  code = read_file(path)
+                  code, hits = replace_balanced_call(
+                      code,
+                      r"\.formatDate\s*\(",
+                      lambda _m, _call: '.let { "" }',
+                  )
+                  write_file(path, code)
+                  print(f"Patched {path} (formatDate calls blanked={hits})")
+
+          def patch_properties_dialogs() -> None:
+              total = 0
+              for kt_file in ROOT.rglob("*.kt"):
+                  if kt_file.name == "NoDatePropertiesHelper.kt":
+                      continue
+                  code = read_file(kt_file)
+                  if "PropertiesDialog(" not in code:
+                      continue
+                  new_code, hits = replace_balanced_call(
+                      code,
+                      r"(?<![.\w])PropertiesDialog\s*\(",
+                      lambda _m, call: f"{call}.stripDateRows()",
+                  )
+                  if hits > 0:
+                      new_code = ensure_import(new_code, "import org.fossify.gallery.helpers.stripDateRows")
+                      write_file(kt_file, new_code)
+                      total += hits
+                      print(f"Patched {kt_file} (PropertiesDialog calls wrapped={hits})")
+              if total == 0:
+                  raise RuntimeError("No PropertiesDialog() calls found to wrap")
+
+          def main() -> None:
+              create_properties_helper()
+              patch_media_fetcher()
+              patch_view_pager_fragment()
+              patch_adapters_format_date()
+              patch_properties_dialogs()
+              print("All No-DateTime patches applied successfully.")
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as err:
+                  print(f"PATCH ERROR: {err}", file=sys.stderr)
+                  sys.exit(1)
+          PYEOF
+
+      - name: Build universal FOSS release APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleFossRelease --no-daemon
+
+      - name: Sign APK
+        run: |
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          RAW_APK=$(find app/build/outputs/apk/foss/release -name "*foss-release*.apk" ! -name "*armeabi*" ! -name "*arm64*" ! -name "*x86*" | head -n 1)
+          if [ -z "$RAW_APK" ]; then
+            RAW_APK=$(find app/build/outputs/apk/foss/release -name "*.apk" | head -n 1)
+          fi
+          echo "Signing: $RAW_APK"
+
+          keytool -genkeypair -v \
+            -keystore custom.keystore \
+            -alias customkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -storepass custompass -keypass custompass \
+            -dname "CN=CustomGallery, OU=Personal, O=Personal, L=Local, S=Local, C=IN"
+
+          "$BUILD_TOOLS/zipalign" -f -p 4 "$RAW_APK" aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks custom.keystore \
+            --ks-key-alias customkey \
+            --ks-pass pass:custompass \
+            --key-pass pass:custompass \
+            --out FossifyGallery-NoDateTime.apk \
+            aligned.apk
+          "$BUILD_TOOLS/apksigner" verify FossifyGallery-NoDateTime.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: FossifyGallery-NoDateTime
+          path: FossifyGallery-NoDateTime.apk
