@@ -319,21 +319,32 @@ jobs:
           import android.view.WindowManager
           import android.widget.BaseAdapter
           import android.widget.Button
+          import android.widget.FrameLayout
           import android.widget.GridView
           import android.widget.ImageView
           import android.widget.LinearLayout
           import android.widget.TextView
           import android.widget.Toast
+          import androidx.recyclerview.widget.RecyclerView
+          import androidx.viewpager2.widget.ViewPager2
+          import com.alexvasilkov.gestures.GestureImageView
           import com.bumptech.glide.Glide
           import org.fossify.gallery.helpers.VaultManager
           import java.io.File
 
           class VaultActivity : Activity() {
               private val PICK_MEDIA_REQUEST = 9910
+              private lateinit var gridContainer: LinearLayout
               private lateinit var gridView: GridView
               private lateinit var emptyLabel: TextView
+              private lateinit var viewerContainer: FrameLayout
+              private lateinit var viewPager: ViewPager2
+              private lateinit var viewerTopBar: LinearLayout
+              private lateinit var viewerBottomBar: LinearLayout
+              private lateinit var viewerCounter: TextView
               private var vaultFiles: List<File> = emptyList()
               private var pickingExternal = false
+              private var viewerBarsVisible = true
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -342,10 +353,30 @@ jobs:
                       WindowManager.LayoutParams.FLAG_SECURE,
                   )
 
-                  val root = LinearLayout(this).apply {
+                  val root = FrameLayout(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                      layoutParams = ViewGroup.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                      )
+                  }
+
+                  gridContainer = buildGridContainer()
+                  viewerContainer = buildViewerContainer()
+                  viewerContainer.visibility = View.GONE
+
+                  root.addView(gridContainer)
+                  root.addView(viewerContainer)
+                  setContentView(root)
+
+                  refreshVaultData()
+              }
+
+              private fun buildGridContainer(): LinearLayout {
+                  val container = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       setBackgroundColor(Color.parseColor("#121212"))
-                      layoutParams = ViewGroup.LayoutParams(
+                      layoutParams = FrameLayout.LayoutParams(
                           ViewGroup.LayoutParams.MATCH_PARENT,
                           ViewGroup.LayoutParams.MATCH_PARENT,
                       )
@@ -397,19 +428,161 @@ jobs:
                           0,
                           1f,
                       )
+                      setOnItemClickListener { _, _, position, _ ->
+                          openFullScreenViewer(position)
+                      }
                   }
 
-                  root.addView(topBar)
-                  root.addView(emptyLabel)
-                  root.addView(gridView)
-                  setContentView(root)
+                  container.addView(topBar)
+                  container.addView(emptyLabel)
+                  container.addView(gridView)
+                  return container
+              }
 
-                  gridView.setOnItemClickListener { _, _, position, _ ->
-                      val file = vaultFiles.getOrNull(position) ?: return@setOnItemClickListener
-                      showFilePreview(file)
+              private fun buildViewerContainer(): FrameLayout {
+                  val container = FrameLayout(this).apply {
+                      setBackgroundColor(Color.BLACK)
+                      layoutParams = FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                      )
                   }
 
-                  refreshGrid()
+                  viewPager = ViewPager2(this).apply {
+                      orientation = ViewPager2.ORIENTATION_HORIZONTAL
+                      layoutParams = FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                      )
+                      registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
+                          override fun onPageSelected(position: Int) {
+                              updateCounter(position)
+                          }
+                      })
+                  }
+
+                  viewerTopBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setBackgroundColor(Color.parseColor("#AA000000"))
+                      setPadding(24, 56, 24, 24)
+                      layoutParams = FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          Gravity.TOP,
+                      )
+                  }
+
+                  val backBtn = Button(this).apply {
+                      text = "Back"
+                      setOnClickListener { closeFullScreenViewer() }
+                  }
+
+                  viewerCounter = TextView(this).apply {
+                      textSize = 17f
+                      setTextColor(Color.WHITE)
+                      gravity = Gravity.END
+                      layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+
+                  viewerTopBar.addView(backBtn)
+                  viewerTopBar.addView(viewerCounter)
+
+                  viewerBottomBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER
+                      setBackgroundColor(Color.parseColor("#AA000000"))
+                      setPadding(24, 24, 24, 48)
+                      layoutParams = FrameLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT,
+                          Gravity.BOTTOM,
+                      )
+                  }
+
+                  val restoreBtn = Button(this).apply {
+                      text = "Restore"
+                      setOnClickListener { restoreCurrentViewerPhoto() }
+                  }
+
+                  val deleteBtn = Button(this).apply {
+                      text = "Delete"
+                      setOnClickListener { deleteCurrentViewerPhoto() }
+                  }
+
+                  viewerBottomBar.addView(restoreBtn)
+                  viewerBottomBar.addView(deleteBtn)
+
+                  container.addView(viewPager)
+                  container.addView(viewerTopBar)
+                  container.addView(viewerBottomBar)
+                  return container
+              }
+
+              private fun openFullScreenViewer(position: Int) {
+                  if (vaultFiles.isEmpty()) return
+                  val safePos = position.coerceIn(0, vaultFiles.lastIndex)
+                  viewPager.adapter = VaultPagerAdapter(vaultFiles)
+                  viewPager.setCurrentItem(safePos, false)
+                  updateCounter(safePos)
+                  viewerBarsVisible = true
+                  viewerTopBar.visibility = View.VISIBLE
+                  viewerBottomBar.visibility = View.VISIBLE
+                  viewerContainer.visibility = View.VISIBLE
+                  gridContainer.visibility = View.GONE
+              }
+
+              private fun closeFullScreenViewer() {
+                  viewerContainer.visibility = View.GONE
+                  gridContainer.visibility = View.VISIBLE
+              }
+
+              private fun toggleViewerBars() {
+                  viewerBarsVisible = !viewerBarsVisible
+                  val vis = if (viewerBarsVisible) View.VISIBLE else View.GONE
+                  viewerTopBar.visibility = vis
+                  viewerBottomBar.visibility = vis
+              }
+
+              private fun updateCounter(position: Int) {
+                  if (vaultFiles.isEmpty()) {
+                      viewerCounter.text = ""
+                  } else {
+                      viewerCounter.text = "${position + 1} / ${vaultFiles.size}"
+                  }
+              }
+
+              private fun restoreCurrentViewerPhoto() {
+                  val pos = viewPager.currentItem
+                  val file = vaultFiles.getOrNull(pos) ?: return
+                  VaultManager.restoreFromVault(this, file) {
+                      refreshVaultData(keepViewerAt = pos)
+                  }
+              }
+
+              private fun deleteCurrentViewerPhoto() {
+                  val pos = viewPager.currentItem
+                  val file = vaultFiles.getOrNull(pos) ?: return
+                  AlertDialog.Builder(this)
+                      .setTitle("Delete permanently?")
+                      .setMessage("This photo will be permanently deleted from the vault.")
+                      .setPositiveButton("Delete") { _, _ ->
+                          if (file.delete()) {
+                              Toast.makeText(this, "Deleted", Toast.LENGTH_SHORT).show()
+                              refreshVaultData(keepViewerAt = pos)
+                          }
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  if (viewerContainer.visibility == View.VISIBLE) {
+                      closeFullScreenViewer()
+                  } else {
+                      super.onBackPressed()
+                  }
               }
 
               override fun onStop() {
@@ -437,55 +610,35 @@ jobs:
                       if (clipData != null) {
                           for (i in 0 until clipData.itemCount) {
                               val uri = clipData.getItemAt(i).uri
-                              VaultManager.importUriToVault(this, uri) { refreshGrid() }
+                              VaultManager.importUriToVault(this, uri) { refreshVaultData() }
                           }
                       } else {
                           data.data?.let { uri ->
-                              VaultManager.importUriToVault(this, uri) { refreshGrid() }
+                              VaultManager.importUriToVault(this, uri) { refreshVaultData() }
                           }
                       }
                   }
               }
 
-              private fun refreshGrid() {
+              private fun refreshVaultData(keepViewerAt: Int? = null) {
                   vaultFiles = VaultManager.listVaultFiles(this)
                   emptyLabel.visibility = if (vaultFiles.isEmpty()) View.VISIBLE else View.GONE
                   gridView.visibility = if (vaultFiles.isEmpty()) View.GONE else View.VISIBLE
-                  gridView.adapter = VaultAdapter(vaultFiles)
-              }
+                  gridView.adapter = VaultGridAdapter(vaultFiles)
 
-              private fun showFilePreview(file: File) {
-                  val imageView = ImageView(this).apply {
-                      adjustViewBounds = true
-                      scaleType = ImageView.ScaleType.FIT_CENTER
-                      setBackgroundColor(Color.BLACK)
-                      setPadding(16, 16, 16, 16)
+                  if (keepViewerAt != null && viewerContainer.visibility == View.VISIBLE) {
+                      if (vaultFiles.isEmpty()) {
+                          closeFullScreenViewer()
+                      } else {
+                          val nextPos = keepViewerAt.coerceIn(0, vaultFiles.lastIndex)
+                          viewPager.adapter = VaultPagerAdapter(vaultFiles)
+                          viewPager.setCurrentItem(nextPos, false)
+                          updateCounter(nextPos)
+                      }
                   }
-                  Glide.with(this).load(file).into(imageView)
-
-                  AlertDialog.Builder(this)
-                      .setView(imageView)
-                      .setPositiveButton("Restore") { _, _ ->
-                          VaultManager.restoreFromVault(this, file) { refreshGrid() }
-                      }
-                      .setNeutralButton("Delete") { _, _ ->
-                          AlertDialog.Builder(this)
-                              .setTitle("Delete permanently?")
-                              .setMessage("This photo will be permanently deleted from the vault.")
-                              .setPositiveButton("Delete") { _, _ ->
-                                  if (file.delete()) {
-                                      Toast.makeText(this, "Deleted", Toast.LENGTH_SHORT).show()
-                                      refreshGrid()
-                                  }
-                              }
-                              .setNegativeButton("Cancel", null)
-                              .show()
-                      }
-                      .setNegativeButton("Close", null)
-                      .show()
               }
 
-              private inner class VaultAdapter(private val items: List<File>) : BaseAdapter() {
+              private inner class VaultGridAdapter(private val items: List<File>) : BaseAdapter() {
                   override fun getCount(): Int = items.size
                   override fun getItem(position: Int): Any = items[position]
                   override fun getItemId(position: Int): Long = position.toLong()
@@ -499,6 +652,28 @@ jobs:
                       Glide.with(this@VaultActivity).load(items[position]).centerCrop().into(iv)
                       return iv
                   }
+              }
+
+              private inner class VaultPageHolder(val imageView: GestureImageView) : RecyclerView.ViewHolder(imageView)
+
+              private inner class VaultPagerAdapter(private val items: List<File>) : RecyclerView.Adapter<VaultPageHolder>() {
+                  override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VaultPageHolder {
+                      val iv = GestureImageView(parent.context).apply {
+                          layoutParams = ViewGroup.LayoutParams(
+                              ViewGroup.LayoutParams.MATCH_PARENT,
+                              ViewGroup.LayoutParams.MATCH_PARENT,
+                          )
+                          setBackgroundColor(Color.BLACK)
+                          setOnClickListener { toggleViewerBars() }
+                      }
+                      return VaultPageHolder(iv)
+                  }
+
+                  override fun onBindViewHolder(holder: VaultPageHolder, position: Int) {
+                      Glide.with(this@VaultActivity).load(items[position]).into(holder.imageView)
+                  }
+
+                  override fun getItemCount(): Int = items.size
               }
           }
           """
@@ -679,6 +854,13 @@ jobs:
                   ROOT / "activities/MainActivity.kt",
                   "binding.mainMenu.toolbar!!.menu",
                   991001,
+                  "Private Vault",
+                  "VaultManager.promptAndOpenVault(this)",
+              )
+              inject_menu_hook(
+                  ROOT / "activities/MediaActivity.kt",
+                  "binding.mediaMenu.toolbar!!.menu",
+                  991003,
                   "Private Vault",
                   "VaultManager.promptAndOpenVault(this)",
               )
