@@ -677,7 +677,7 @@ jobs:
           def patch_vault_menus() -> None:
               inject_menu_hook(
                   ROOT / "activities/MainActivity.kt",
-                  "binding.mainMenu.getToolbar().menu",
+                  "binding.mainMenu.toolbar.menu",
                   991001,
                   "Private Vault",
                   "VaultManager.promptAndOpenVault(this)",
