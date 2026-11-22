@@ -1055,6 +1055,9 @@ jobs:
           ./gradlew :app:assembleFossRelease --no-daemon
 
       - name: Sign APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASS: ${{ secrets.KEYSTORE_PASS }}
         run: |
           BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
           RAW_APK=$(find app/build/outputs/apk/foss/release -name "*foss-release*.apk" ! -name "*armeabi*" ! -name "*arm64*" ! -name "*x86*" | head -n 1)
@@ -1063,22 +1066,23 @@ jobs:
           fi
           echo "Signing: $RAW_APK"
 
-          keytool -genkeypair -v \
-            -keystore custom.keystore \
-            -alias customkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass custompass -keypass custompass \
-            -dname "CN=CustomGallery, OU=Personal, O=Personal, L=Local, S=Local, C=IN"
+          if [ -z "$KEYSTORE_BASE64" ] || [ -z "$KEYSTORE_PASS" ]; then
+            echo "ERROR: Missing KEYSTORE_BASE64 or KEYSTORE_PASS repository secrets." >&2
+            exit 1
+          fi
+
+          printf '%s' "$KEYSTORE_BASE64" | tr -d '[:space:]' | base64 -d > custom.keystore
 
           "$BUILD_TOOLS/zipalign" -f -p 4 "$RAW_APK" aligned.apk
           "$BUILD_TOOLS/apksigner" sign \
             --ks custom.keystore \
-            --ks-key-alias customkey \
-            --ks-pass pass:custompass \
-            --key-pass pass:custompass \
+            --ks-key-alias gallerykey \
+            --ks-pass env:KEYSTORE_PASS \
+            --key-pass env:KEYSTORE_PASS \
             --out FossifyGallery-NoDateTime.apk \
             aligned.apk
           "$BUILD_TOOLS/apksigner" verify FossifyGallery-NoDateTime.apk
+          rm -f custom.keystore
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
