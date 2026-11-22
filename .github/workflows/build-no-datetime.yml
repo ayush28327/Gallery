@@ -26,6 +26,7 @@ jobs:
 
           ROOT = pathlib.Path("app/src/main/kotlin/org/fossify/gallery")
           MANIFEST = pathlib.Path("app/src/main/AndroidManifest.xml")
+          LAYOUT_DIR = pathlib.Path("app/src/main/res/layout")
 
           def read_file(path: pathlib.Path) -> str:
               try:
@@ -47,6 +48,8 @@ jobs:
           import android.view.View
           import android.view.ViewGroup
           import android.widget.TextView
+          import androidx.recyclerview.widget.RecyclerView
+          import com.qtalk.recyclerviewfastscroller.RecyclerViewFastScroller
           import org.fossify.commons.dialogs.BasePropertiesDialog
           import org.fossify.commons.dialogs.PropertiesDialog
 
@@ -68,7 +71,8 @@ jobs:
               fun hideIfDateRow(child: View?) {
                   val labelView = child?.findViewById<TextView>(org.fossify.commons.R.id.property_label) ?: return
                   val label = labelView.text?.toString()?.trim().orEmpty()
-                  if (label in blockedLabels) {
+                  val lower = label.lowercase()
+                  if (label in blockedLabels || "date" in lower || "modified" in lower) {
                       child.visibility = View.GONE
                   }
               }
@@ -84,6 +88,27 @@ jobs:
                   override fun onChildViewRemoved(parent: View?, child: View?) = Unit
               })
               return this
+          }
+
+          fun RecyclerViewFastScroller.disableCompletely() {
+              isFastScrollEnabled = false
+              val hideFastScrollerViews = {
+                  try {
+                      popupTextView.visibility = View.GONE
+                      popupTextView.text = ""
+                  } catch (_: Throwable) {
+                  }
+                  for (i in 0 until childCount) {
+                      val child = getChildAt(i)
+                      if (child !is RecyclerView) {
+                          child.visibility = View.GONE
+                          child.isEnabled = false
+                          child.setOnTouchListener { _, _ -> false }
+                      }
+                  }
+              }
+              hideFastScrollerViews()
+              post { hideFastScrollerViews() }
           }
           """
               write_file(helper, content)
@@ -872,6 +897,135 @@ jobs:
                   "getCurrentMedium()?.path?.let { p -> VaultManager.moveToVault(this, p) { finish() } }",
               )
 
+          def patch_models_bubble_text() -> None:
+              targets = [
+                  (
+                      ROOT / "models/Medium.kt",
+                      'fun getBubbleText(sorting: Int, context: Context, dateFormat: String, timeFormat: String) = ""',
+                  ),
+                  (
+                      ROOT / "models/Directory.kt",
+                      'fun getBubbleText(sorting: Int, context: Context, dateFormat: String? = null, timeFormat: String? = null) = ""',
+                  ),
+              ]
+              for path, replacement in targets:
+                  code = read_file(path)
+                  new_code, hits = re.subn(
+                      r"fun\s+getBubbleText\s*\([^)]*\)\s*=\s*when\s*\{[^}]*\}",
+                      replacement,
+                      code,
+                      count=1,
+                      flags=re.DOTALL,
+                  )
+                  if hits == 0:
+                      raise RuntimeError(f"Could not locate getBubbleText() in {path}")
+                  write_file(path, new_code)
+                  print(f"Patched {path} (getBubbleText blanked)")
+
+          def patch_disable_fastscrollers() -> None:
+              xml_hits_total = 0
+              for xml_file in sorted(LAYOUT_DIR.glob("*.xml")):
+                  code = read_file(xml_file)
+                  if "com.qtalk.recyclerviewfastscroller.RecyclerViewFastScroller" not in code:
+                      continue
+                  if 'app:fastScrollEnabled="false"' in code:
+                      continue
+                  new_code, hits = re.subn(
+                      r"(<com\.qtalk\.recyclerviewfastscroller\.RecyclerViewFastScroller\b[^>]*)(>)",
+                      r'\1\n                app:fastScrollEnabled="false"\n                app:handleHasFixedSize="true"\n                app:handleWidth="0dp"\n                app:handleHeight="0dp"\2',
+                      code,
+                  )
+                  if hits > 0:
+                      write_file(xml_file, new_code)
+                      xml_hits_total += hits
+                      print(f"Patched {xml_file} (fastscroller disabled in XML, hits={hits})")
+              if xml_hits_total == 0:
+                  raise RuntimeError("No RecyclerViewFastScroller tags found in layout XMLs")
+
+              kt_hits_total = 0
+              for kt_file in sorted(ROOT.rglob("*.kt")):
+                  if kt_file.name in ("NoDatePropertiesHelper.kt", "VaultManager.kt", "VaultActivity.kt"):
+                      continue
+                  code = read_file(kt_file)
+                  if "Fastscroller.updateColors(" not in code:
+                      continue
+                  new_code, hits = replace_balanced_call(
+                      code,
+                      r"((?:binding\.)?\w*Fastscroller)\.updateColors\s*\(",
+                      lambda m, call: f"{call}\n        {m.group(1)}.disableCompletely()",
+                  )
+                  if hits > 0:
+                      new_code = ensure_import(new_code, "import org.fossify.gallery.helpers.disableCompletely")
+                      write_file(kt_file, new_code)
+                      kt_hits_total += hits
+                      print(f"Patched {kt_file} (disableCompletely hooked, hits={hits})")
+              if kt_hits_total == 0:
+                  raise RuntimeError("No Fastscroller.updateColors() calls found to disable")
+
+          def hide_xml_views_by_id(xml_path: pathlib.Path, view_ids: list[str]) -> int:
+              code = read_file(xml_path)
+              total_hits = 0
+              for vid in view_ids:
+                  pattern = rf'(<[^>]*android:id="@\+id/{re.escape(vid)}"[^>]*?)(/?>)'
+                  def _inject_gone(match: re.Match) -> str:
+                      body, close = match.group(1), match.group(2)
+                      if "android:visibility=" in body:
+                          body = re.sub(r'android:visibility="[^"]*"', 'android:visibility="gone"', body)
+                          return body + close
+                      return body + '\n        android:visibility="gone"' + close
+                  code, hits = re.subn(pattern, _inject_gone, code, count=1, flags=re.DOTALL)
+                  if hits == 0:
+                      raise RuntimeError(f"Could not find view id '{vid}' in {xml_path}")
+                  total_hits += hits
+              write_file(xml_path, code)
+              print(f"Patched {xml_path} (hid {total_hits} date/time views)")
+              return total_hits
+
+          def patch_hide_remaining_datetime_ui() -> None:
+              hide_xml_views_by_id(
+                  LAYOUT_DIR / "activity_settings.xml",
+                  [
+                      "settings_change_date_time_format_holder",
+                      "settings_keep_last_modified_holder",
+                  ],
+              )
+              hide_xml_views_by_id(
+                  LAYOUT_DIR / "dialog_change_grouping.xml",
+                  [
+                      "grouping_dialog_radio_last_modified_daily",
+                      "grouping_dialog_radio_last_modified_monthly",
+                      "grouping_dialog_radio_date_taken_daily",
+                      "grouping_dialog_radio_date_taken_monthly",
+                  ],
+              )
+              hide_xml_views_by_id(
+                  LAYOUT_DIR / "dialog_change_sorting.xml",
+                  [
+                      "sorting_dialog_radio_last_modified",
+                      "sorting_dialog_radio_date_taken",
+                  ],
+              )
+              hide_xml_views_by_id(
+                  LAYOUT_DIR / "dialog_manage_extended_details.xml",
+                  [
+                      "manage_extended_details_last_modified",
+                      "manage_extended_details_date_taken",
+                  ],
+              )
+
+              media_adapter = ROOT / "adapters/MediaAdapter.kt"
+              code = read_file(media_adapter)
+              new_code, hits = re.subn(
+                  r"findItem\(R\.id\.cab_fix_date_taken\)\.isVisible\s*=\s*[^\n]+",
+                  "findItem(R.id.cab_fix_date_taken).isVisible = false",
+                  code,
+                  count=1,
+              )
+              if hits == 0:
+                  raise RuntimeError(f"Could not locate cab_fix_date_taken visibility in {media_adapter}")
+              write_file(media_adapter, new_code)
+              print(f"Patched {media_adapter} (cab_fix_date_taken hidden)")
+
           def main() -> None:
               create_properties_helper()
               create_vault_manager()
@@ -880,6 +1034,9 @@ jobs:
               patch_media_fetcher()
               patch_view_pager_fragment()
               patch_adapters_format_date()
+              patch_models_bubble_text()
+              patch_disable_fastscrollers()
+              patch_hide_remaining_datetime_ui()
               patch_properties_dialogs()
               patch_vault_menus()
               print("All No-DateTime + Private Vault patches applied successfully.")
