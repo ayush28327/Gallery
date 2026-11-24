@@ -646,6 +646,8 @@ jobs:
           import android.graphics.Bitmap
           import android.graphics.BitmapFactory
           import android.graphics.Color
+          import android.graphics.Point
+          import android.graphics.Rect
           import android.graphics.drawable.ColorDrawable
           import android.media.ExifInterface
           import android.net.Uri
@@ -676,7 +678,6 @@ jobs:
           import com.davemorrissey.labs.subscaleview.ImageDecoder
           import com.davemorrissey.labs.subscaleview.ImageRegionDecoder
           import com.davemorrissey.labs.subscaleview.SubsamplingScaleImageView
-          import org.fossify.gallery.helpers.PicassoRegionDecoder
           import org.fossify.gallery.helpers.VaultManager
           import java.io.File
 
@@ -1241,25 +1242,62 @@ jobs:
                   }
               }
 
-              private class SafeBaseImageDecoder : ImageDecoder {
+              private class SafeBaseImageDecoder(private val file: File) : ImageDecoder {
                   override fun decode(context: Context, uri: Uri): Bitmap {
                       val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                      context.contentResolver.openInputStream(uri)?.use { input ->
-                          BitmapFactory.decodeStream(input, null, bounds)
-                      }
+                      BitmapFactory.decodeFile(file.absolutePath, bounds)
                       var sampleSize = 1
                       val maxDim = 2048
-                      while (bounds.outWidth / sampleSize > maxDim || bounds.outHeight / sampleSize > maxDim) {
-                          sampleSize *= 2
+                      if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+                          while (bounds.outWidth / sampleSize > maxDim || bounds.outHeight / sampleSize > maxDim) {
+                              sampleSize *= 2
+                          }
                       }
                       val opts = BitmapFactory.Options().apply {
                           inSampleSize = sampleSize
                           inPreferredConfig = Bitmap.Config.ARGB_8888
                       }
-                      val bmp = context.contentResolver.openInputStream(uri)?.use { input ->
-                          BitmapFactory.decodeStream(input, null, opts)
+                      return BitmapFactory.decodeFile(file.absolutePath, opts)
+                          ?: throw RuntimeException("Base decoder returned null bitmap")
+                  }
+              }
+
+              private class SafeRegionDecoder(private val file: File) : ImageRegionDecoder {
+                  private var decoder: android.graphics.BitmapRegionDecoder? = null
+                  private val lock = Any()
+
+                  override fun init(context: Context, uri: Uri): Point {
+                      val dec = android.graphics.BitmapRegionDecoder.newInstance(file.absolutePath, false)
+                          ?: throw RuntimeException("Region decoder unsupported for this file")
+                      decoder = dec
+                      return Point(dec.width, dec.height)
+                  }
+
+                  override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap {
+                      synchronized(lock) {
+                          val dec = decoder ?: throw IllegalStateException("Region decoder not initialized")
+                          val opts = BitmapFactory.Options().apply {
+                              inSampleSize = sampleSize.coerceAtLeast(1)
+                              inPreferredConfig = Bitmap.Config.ARGB_8888
+                          }
+                          return dec.decodeRegion(sRect, opts)
+                              ?: throw RuntimeException("Region decode returned null bitmap")
                       }
-                      return bmp ?: throw RuntimeException("Base decoder returned null bitmap")
+                  }
+
+                  override fun isReady(): Boolean {
+                      val dec = decoder
+                      return dec != null && !dec.isRecycled
+                  }
+
+                  override fun recycle() {
+                      synchronized(lock) {
+                          try {
+                              decoder?.recycle()
+                          } catch (_: Throwable) {
+                          }
+                          decoder = null
+                      }
                   }
               }
 
@@ -1272,6 +1310,18 @@ jobs:
               ) : RecyclerView.ViewHolder(root)
 
               private inner class VaultPagerAdapter(private val items: List<File>) : RecyclerView.Adapter<VaultPageHolder>() {
+                  private fun loadFallbackImage(holder: VaultPageHolder, file: File) {
+                      try {
+                          holder.subsamplingView.visibility = View.GONE
+                          holder.imageView.visibility = View.VISIBLE
+                          Glide.with(this@VaultActivity)
+                              .load(file)
+                              .apply(RequestOptions().format(DecodeFormat.PREFER_ARGB_8888).override(4096))
+                              .into(holder.imageView)
+                      } catch (_: Throwable) {
+                      }
+                  }
+
                   override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VaultPageHolder {
                       val root = FrameLayout(parent.context).apply {
                           layoutParams = ViewGroup.LayoutParams(
@@ -1279,6 +1329,14 @@ jobs:
                               ViewGroup.LayoutParams.MATCH_PARENT,
                           )
                           setBackgroundColor(Color.BLACK)
+                      }
+                      val iv = GestureImageView(parent.context).apply {
+                          layoutParams = FrameLayout.LayoutParams(
+                              FrameLayout.LayoutParams.MATCH_PARENT,
+                              FrameLayout.LayoutParams.MATCH_PARENT,
+                          )
+                          setBackgroundColor(Color.BLACK)
+                          setOnClickListener { toggleViewerBars() }
                       }
                       val subView = SubsamplingScaleImageView(parent.context).apply {
                           layoutParams = FrameLayout.LayoutParams(
@@ -1290,14 +1348,6 @@ jobs:
                           setMinimumTileDpi(-1)
                           maxScale = 20f
                           isOneToOneZoomEnabled = true
-                          setOnClickListener { toggleViewerBars() }
-                      }
-                      val iv = GestureImageView(parent.context).apply {
-                          layoutParams = FrameLayout.LayoutParams(
-                              FrameLayout.LayoutParams.MATCH_PARENT,
-                              FrameLayout.LayoutParams.MATCH_PARENT,
-                          )
-                          setBackgroundColor(Color.BLACK)
                           setOnClickListener { toggleViewerBars() }
                       }
                       val vv = VideoView(parent.context).apply {
@@ -1315,8 +1365,8 @@ jobs:
                               Gravity.CENTER,
                           )
                       }
-                      root.addView(subView)
                       root.addView(iv)
+                      root.addView(subView)
                       root.addView(vv)
                       root.addView(playBtn)
                       return VaultPageHolder(root, subView, iv, vv, playBtn)
@@ -1324,7 +1374,10 @@ jobs:
 
                   override fun onBindViewHolder(holder: VaultPageHolder, position: Int) {
                       val file = items[position]
-                      holder.subsamplingView.recycle()
+                      try {
+                          holder.subsamplingView.recycle()
+                      } catch (_: Throwable) {
+                      }
                       if (VaultManager.isVideoFile(file)) {
                           holder.subsamplingView.visibility = View.GONE
                           holder.imageView.visibility = View.VISIBLE
@@ -1356,41 +1409,41 @@ jobs:
                           holder.imageView.visibility = View.GONE
                           holder.subsamplingView.visibility = View.VISIBLE
 
-                          val screenW = resources.displayMetrics.widthPixels
-                          val screenH = resources.displayMetrics.heightPixels
-                          holder.subsamplingView.apply {
-                              setMaxTileSize(2048)
-                              setMinimumTileDpi(-1)
-                              maxScale = 20f
-                              isOneToOneZoomEnabled = true
-                              orientation = readExifRotationDegrees(file)
-                              bitmapDecoderFactory = object : DecoderFactory<ImageDecoder> {
-                                  override fun make() = SafeBaseImageDecoder()
-                              }
-                              regionDecoderFactory = object : DecoderFactory<ImageRegionDecoder> {
-                                  override fun make() = PicassoRegionDecoder(true, screenW, screenH, -1)
-                              }
-                              onImageEventListener = object : SubsamplingScaleImageView.OnImageEventListener {
-                                  override fun onReady() = Unit
-                                  override fun onImageLoadError(e: Exception) {
-                                      holder.subsamplingView.visibility = View.GONE
-                                      holder.imageView.visibility = View.VISIBLE
-                                      Glide.with(this@VaultActivity)
-                                          .load(file)
-                                          .apply(RequestOptions().format(DecodeFormat.PREFER_ARGB_8888).override(4096))
-                                          .into(holder.imageView)
+                          try {
+                              holder.subsamplingView.apply {
+                                  setMaxTileSize(2048)
+                                  setMinimumTileDpi(-1)
+                                  maxScale = 20f
+                                  isOneToOneZoomEnabled = true
+                                  orientation = readExifRotationDegrees(file)
+                                  bitmapDecoderFactory = object : DecoderFactory<ImageDecoder> {
+                                      override fun make() = SafeBaseImageDecoder(file)
                                   }
-                                  override fun onImageRotation(degrees: Int) = Unit
-                                  override fun onUpEvent() = Unit
+                                  regionDecoderFactory = object : DecoderFactory<ImageRegionDecoder> {
+                                      override fun make() = SafeRegionDecoder(file)
+                                  }
+                                  onImageEventListener = object : SubsamplingScaleImageView.OnImageEventListener {
+                                      override fun onReady() = Unit
+                                      override fun onImageLoadError(e: Exception) {
+                                          runOnUiThread { loadFallbackImage(holder, file) }
+                                      }
+                                      override fun onImageRotation(degrees: Int) = Unit
+                                      override fun onUpEvent() = Unit
+                                  }
+                                  setImage(file.absolutePath)
                               }
-                              setImage(file.absolutePath)
+                          } catch (_: Throwable) {
+                              loadFallbackImage(holder, file)
                           }
                       }
                   }
 
                   override fun onViewRecycled(holder: VaultPageHolder) {
                       super.onViewRecycled(holder)
-                      holder.subsamplingView.recycle()
+                      try {
+                          holder.subsamplingView.recycle()
+                      } catch (_: Throwable) {
+                      }
                   }
 
                   override fun getItemCount(): Int = items.size
