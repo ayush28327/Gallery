@@ -120,7 +120,6 @@ jobs:
 
           import android.app.Activity
           import android.app.AlertDialog
-          import android.content.Context
           import android.content.Intent
           import android.media.MediaScannerConnection
           import android.net.Uri
@@ -643,13 +642,7 @@ jobs:
           import android.app.AlertDialog
           import android.content.Intent
           import android.content.Context
-          import android.graphics.Bitmap
-          import android.graphics.BitmapFactory
           import android.graphics.Color
-          import android.graphics.Point
-          import android.graphics.Rect
-          import android.graphics.drawable.ColorDrawable
-          import android.media.ExifInterface
           import android.net.Uri
           import android.os.Bundle
           import android.os.Handler
@@ -674,10 +667,6 @@ jobs:
           import com.bumptech.glide.Glide
           import com.bumptech.glide.load.DecodeFormat
           import com.bumptech.glide.request.RequestOptions
-          import com.davemorrissey.labs.subscaleview.DecoderFactory
-          import com.davemorrissey.labs.subscaleview.ImageDecoder
-          import com.davemorrissey.labs.subscaleview.ImageRegionDecoder
-          import com.davemorrissey.labs.subscaleview.SubsamplingScaleImageView
           import org.fossify.gallery.helpers.VaultManager
           import java.io.File
 
@@ -1226,102 +1215,14 @@ jobs:
                   }
               }
 
-              private fun readExifRotationDegrees(file: File): Int {
-                  return try {
-                      when (ExifInterface(file.absolutePath).getAttributeInt(
-                          ExifInterface.TAG_ORIENTATION,
-                          ExifInterface.ORIENTATION_NORMAL,
-                      )) {
-                          ExifInterface.ORIENTATION_ROTATE_90 -> 90
-                          ExifInterface.ORIENTATION_ROTATE_180 -> 180
-                          ExifInterface.ORIENTATION_ROTATE_270 -> 270
-                          else -> 0
-                      }
-                  } catch (_: Throwable) {
-                      0
-                  }
-              }
-
-              private class SafeBaseImageDecoder(private val file: File) : ImageDecoder {
-                  override fun decode(context: Context, uri: Uri): Bitmap {
-                      val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                      BitmapFactory.decodeFile(file.absolutePath, bounds)
-                      var sampleSize = 1
-                      val maxDim = 2048
-                      if (bounds.outWidth > 0 && bounds.outHeight > 0) {
-                          while (bounds.outWidth / sampleSize > maxDim || bounds.outHeight / sampleSize > maxDim) {
-                              sampleSize *= 2
-                          }
-                      }
-                      val opts = BitmapFactory.Options().apply {
-                          inSampleSize = sampleSize
-                          inPreferredConfig = Bitmap.Config.ARGB_8888
-                      }
-                      return BitmapFactory.decodeFile(file.absolutePath, opts)
-                          ?: throw RuntimeException("Base decoder returned null bitmap")
-                  }
-              }
-
-              private class SafeRegionDecoder(private val file: File) : ImageRegionDecoder {
-                  private var decoder: android.graphics.BitmapRegionDecoder? = null
-                  private val lock = Any()
-
-                  override fun init(context: Context, uri: Uri): Point {
-                      val dec = android.graphics.BitmapRegionDecoder.newInstance(file.absolutePath, false)
-                          ?: throw RuntimeException("Region decoder unsupported for this file")
-                      decoder = dec
-                      return Point(dec.width, dec.height)
-                  }
-
-                  override fun decodeRegion(sRect: Rect, sampleSize: Int): Bitmap {
-                      synchronized(lock) {
-                          val dec = decoder ?: throw IllegalStateException("Region decoder not initialized")
-                          val opts = BitmapFactory.Options().apply {
-                              inSampleSize = sampleSize.coerceAtLeast(1)
-                              inPreferredConfig = Bitmap.Config.ARGB_8888
-                          }
-                          return dec.decodeRegion(sRect, opts)
-                              ?: throw RuntimeException("Region decode returned null bitmap")
-                      }
-                  }
-
-                  override fun isReady(): Boolean {
-                      val dec = decoder
-                      return dec != null && !dec.isRecycled
-                  }
-
-                  override fun recycle() {
-                      synchronized(lock) {
-                          try {
-                              decoder?.recycle()
-                          } catch (_: Throwable) {
-                          }
-                          decoder = null
-                      }
-                  }
-              }
-
               private inner class VaultPageHolder(
                   val root: FrameLayout,
-                  val subsamplingView: SubsamplingScaleImageView,
                   val imageView: GestureImageView,
                   val videoView: VideoView,
                   val playButton: Button,
               ) : RecyclerView.ViewHolder(root)
 
               private inner class VaultPagerAdapter(private val items: List<File>) : RecyclerView.Adapter<VaultPageHolder>() {
-                  private fun loadFallbackImage(holder: VaultPageHolder, file: File) {
-                      try {
-                          holder.subsamplingView.visibility = View.GONE
-                          holder.imageView.visibility = View.VISIBLE
-                          Glide.with(this@VaultActivity)
-                              .load(file)
-                              .apply(RequestOptions().format(DecodeFormat.PREFER_ARGB_8888).override(4096))
-                              .into(holder.imageView)
-                      } catch (_: Throwable) {
-                      }
-                  }
-
                   override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VaultPageHolder {
                       val root = FrameLayout(parent.context).apply {
                           layoutParams = ViewGroup.LayoutParams(
@@ -1336,18 +1237,7 @@ jobs:
                               FrameLayout.LayoutParams.MATCH_PARENT,
                           )
                           setBackgroundColor(Color.BLACK)
-                          setOnClickListener { toggleViewerBars() }
-                      }
-                      val subView = SubsamplingScaleImageView(parent.context).apply {
-                          layoutParams = FrameLayout.LayoutParams(
-                              FrameLayout.LayoutParams.MATCH_PARENT,
-                              FrameLayout.LayoutParams.MATCH_PARENT,
-                          )
-                          background = ColorDrawable(Color.BLACK)
-                          setMaxTileSize(2048)
-                          setMinimumTileDpi(-1)
-                          maxScale = 20f
-                          isOneToOneZoomEnabled = true
+                          controller.settings.maxZoom = 8f
                           setOnClickListener { toggleViewerBars() }
                       }
                       val vv = VideoView(parent.context).apply {
@@ -1366,20 +1256,14 @@ jobs:
                           )
                       }
                       root.addView(iv)
-                      root.addView(subView)
                       root.addView(vv)
                       root.addView(playBtn)
-                      return VaultPageHolder(root, subView, iv, vv, playBtn)
+                      return VaultPageHolder(root, iv, vv, playBtn)
                   }
 
                   override fun onBindViewHolder(holder: VaultPageHolder, position: Int) {
                       val file = items[position]
-                      try {
-                          holder.subsamplingView.recycle()
-                      } catch (_: Throwable) {
-                      }
                       if (VaultManager.isVideoFile(file)) {
-                          holder.subsamplingView.visibility = View.GONE
                           holder.imageView.visibility = View.VISIBLE
                           holder.videoView.visibility = View.GONE
                           holder.playButton.visibility = View.VISIBLE
@@ -1406,43 +1290,16 @@ jobs:
                       } else {
                           holder.videoView.visibility = View.GONE
                           holder.playButton.visibility = View.GONE
-                          holder.imageView.visibility = View.GONE
-                          holder.subsamplingView.visibility = View.VISIBLE
-
-                          try {
-                              holder.subsamplingView.apply {
-                                  setMaxTileSize(2048)
-                                  setMinimumTileDpi(-1)
-                                  maxScale = 20f
-                                  isOneToOneZoomEnabled = true
-                                  orientation = readExifRotationDegrees(file)
-                                  bitmapDecoderFactory = object : DecoderFactory<ImageDecoder> {
-                                      override fun make() = SafeBaseImageDecoder(file)
-                                  }
-                                  regionDecoderFactory = object : DecoderFactory<ImageRegionDecoder> {
-                                      override fun make() = SafeRegionDecoder(file)
-                                  }
-                                  onImageEventListener = object : SubsamplingScaleImageView.OnImageEventListener {
-                                      override fun onReady() = Unit
-                                      override fun onImageLoadError(e: Exception) {
-                                          runOnUiThread { loadFallbackImage(holder, file) }
-                                      }
-                                      override fun onImageRotation(degrees: Int) = Unit
-                                      override fun onUpEvent() = Unit
-                                  }
-                                  setImage(file.absolutePath)
-                              }
-                          } catch (_: Throwable) {
-                              loadFallbackImage(holder, file)
-                          }
-                      }
-                  }
-
-                  override fun onViewRecycled(holder: VaultPageHolder) {
-                      super.onViewRecycled(holder)
-                      try {
-                          holder.subsamplingView.recycle()
-                      } catch (_: Throwable) {
+                          holder.imageView.visibility = View.VISIBLE
+                          Glide.with(this@VaultActivity)
+                              .load(file)
+                              .apply(
+                                  RequestOptions()
+                                      .format(DecodeFormat.PREFER_ARGB_8888)
+                                      .override(4096)
+                                      .fitCenter()
+                              )
+                              .into(holder.imageView)
                       }
                   }
 
