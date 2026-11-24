@@ -753,7 +753,7 @@ jobs:
                   topBar.addView(lockBtn)
 
                   emptyLabel = TextView(this).apply {
-                      text = "No hidden items yet.\nUse '+ Add' or select photos/videos -> Move to Vault."
+                      text = "No hidden items yet.\\nUse '+ Add' or select photos/videos -> Move to Vault."
                       setTextColor(Color.LTGRAY)
                       textSize = 15f
                       gravity = Gravity.CENTER
