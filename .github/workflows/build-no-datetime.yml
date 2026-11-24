@@ -1306,7 +1306,7 @@ jobs:
                   var_name = match.group(3)
                   replacement = (
                       f"{match.group(1)}vaultSearch@{match.group(2)}"
-                      f"\n            if (VaultManager.handleSearchQuery(this, {var_name}) {{ {menu_ref}.closeSearch() }}) {{\n"
+                      f"\n            if (VaultManager.handleSearchQuery(this, {var_name}, {{ {menu_ref}.closeSearch() }})) {{\n"
                       f"                return@vaultSearch\n"
                       f"            }}\n"
                   )
