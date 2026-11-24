@@ -130,17 +130,73 @@ jobs:
           import android.provider.OpenableColumns
           import android.text.InputFilter
           import android.text.InputType
+          import android.view.WindowManager
           import android.widget.EditText
           import android.widget.Toast
+          import com.bumptech.glide.Glide
           import org.fossify.gallery.activities.VaultActivity
           import java.io.File
           import java.io.FileInputStream
           import java.io.FileOutputStream
+          import java.io.RandomAccessFile
           import kotlin.concurrent.thread
 
           object VaultManager {
               private const val PASSCODE = "291006"
               private const val VAULT_DIR_NAME = "private_vault_291006"
+              private const val PREFS_NAME = "vault_security_prefs"
+              private const val KEY_FAILED_ATTEMPTS = "failed_attempts"
+              private const val MAX_FAILED_ATTEMPTS = 3
+
+              private fun getFailedAttempts(context: Context): Int {
+                  return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .getInt(KEY_FAILED_ATTEMPTS, 0)
+              }
+
+              private fun setFailedAttempts(context: Context, count: Int) {
+                  context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .edit()
+                      .putInt(KEY_FAILED_ATTEMPTS, count)
+                      .commit()
+              }
+
+              private fun secureDeleteFile(file: File) {
+                  try {
+                      if (file.isFile && file.length() > 0L) {
+                          val wipeBytes = minOf(file.length(), 65536L).toInt()
+                          RandomAccessFile(file, "rw").use { raf ->
+                              raf.seek(0L)
+                              raf.write(ByteArray(wipeBytes))
+                              raf.fd.sync()
+                          }
+                      }
+                  } catch (_: Throwable) {
+                  }
+                  try {
+                      file.delete()
+                  } catch (_: Throwable) {
+                  }
+              }
+
+              private fun wipeVaultCompletely(activity: Activity) {
+                  setFailedAttempts(activity, 0)
+                  try {
+                      Glide.get(activity.applicationContext).clearMemory()
+                  } catch (_: Throwable) {
+                  }
+                  thread {
+                      try {
+                          getVaultDir(activity).listFiles()?.forEach { file ->
+                              secureDeleteFile(file)
+                          }
+                      } catch (_: Throwable) {
+                      }
+                      try {
+                          Glide.get(activity.applicationContext).clearDiskCache()
+                      } catch (_: Throwable) {
+                      }
+                  }
+              }
 
               fun getVaultDir(context: Context): File {
                   val dir = File(context.filesDir, VAULT_DIR_NAME)
@@ -164,19 +220,47 @@ jobs:
                       filters = arrayOf(InputFilter.LengthFilter(6))
                       hint = "Enter 6-digit passcode"
                   }
-                  AlertDialog.Builder(activity)
+                  val dialog = AlertDialog.Builder(activity)
                       .setTitle("Private Vault")
                       .setView(input)
                       .setPositiveButton("Unlock") { _, _ ->
-                          if (input.text?.toString() == PASSCODE) {
+                          val entered = input.text?.toString().orEmpty()
+                          if (entered.isEmpty()) {
+                              Toast.makeText(activity, "Enter passcode", Toast.LENGTH_SHORT).show()
+                              return@setPositiveButton
+                          }
+                          if (entered == PASSCODE) {
+                              setFailedAttempts(activity, 0)
                               val intent = Intent(activity, VaultActivity::class.java)
                               activity.startActivity(intent)
                           } else {
-                              Toast.makeText(activity, "Incorrect passcode", Toast.LENGTH_SHORT).show()
+                              val attempts = getFailedAttempts(activity) + 1
+                              if (attempts > MAX_FAILED_ATTEMPTS) {
+                                  wipeVaultCompletely(activity)
+                                  Toast.makeText(
+                                      activity,
+                                      "Too many wrong attempts. Vault cleared.",
+                                      Toast.LENGTH_LONG,
+                                  ).show()
+                              } else {
+                                  setFailedAttempts(activity, attempts)
+                                  val left = (MAX_FAILED_ATTEMPTS + 1) - attempts
+                                  val msg = if (left == 1) {
+                                      "Incorrect passcode (LAST attempt before auto-wipe!)"
+                                  } else {
+                                      "Incorrect passcode ($left attempts left before auto-wipe)"
+                                  }
+                                  Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
+                              }
                           }
                       }
                       .setNegativeButton("Cancel", null)
-                      .show()
+                      .create()
+                  dialog.window?.setFlags(
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                  )
+                  dialog.show()
               }
 
               fun moveToVault(activity: Activity, sourcePath: String, onSuccess: () -> Unit = {}) {
