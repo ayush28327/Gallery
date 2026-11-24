@@ -460,7 +460,7 @@ jobs:
                           val error = moveSingleFileSync(activity, sourcePath, isDecoy = false)
                           activity.runOnUiThread {
                               if (error == null) {
-                                  Toast.makeText(activity, "Moved to Private Vault", Toast.LENGTH_SHORT).show()
+                                  Toast.makeText(activity, "Archived", Toast.LENGTH_SHORT).show()
                                   onSuccess()
                               } else {
                                   Toast.makeText(activity, error, Toast.LENGTH_LONG).show()
@@ -468,7 +468,7 @@ jobs:
                           }
                       } catch (e: Throwable) {
                           activity.runOnUiThread {
-                              Toast.makeText(activity, "Vault move failed: ${e.message}", Toast.LENGTH_LONG).show()
+                              Toast.makeText(activity, "Archive failed: ${e.message}", Toast.LENGTH_LONG).show()
                           }
                       }
                   }
@@ -494,11 +494,11 @@ jobs:
                       activity.runOnUiThread {
                           val msg = when {
                               movedCount > 0 && lastError == null ->
-                                  "Moved $movedCount ${if (movedCount == 1) "item" else "items"} to Private Vault"
+                                  "Archived $movedCount ${if (movedCount == 1) "item" else "items"}"
                               movedCount > 0 ->
-                                  "Moved $movedCount/${sourcePaths.size} items ($lastError)"
+                                  "Archived $movedCount/${sourcePaths.size} items ($lastError)"
                               else ->
-                                  "Vault move failed: ${lastError ?: "Unknown error"}"
+                                  "Archive failed: ${lastError ?: "Unknown error"}"
                           }
                           Toast.makeText(activity, msg, Toast.LENGTH_LONG).show()
                           onComplete()
@@ -536,7 +536,7 @@ jobs:
 
                           activity.runOnUiThread {
                               val msg = if (deletedOriginal) {
-                                  "Moved to Private Vault"
+                                  "Archived"
                               } else {
                                   "Copied to Vault (delete original if still visible)"
                               }
@@ -584,6 +584,49 @@ jobs:
                           activity.runOnUiThread {
                               Toast.makeText(activity, "Restore failed: ${e.message}", Toast.LENGTH_LONG).show()
                           }
+                      }
+                  }
+              }
+
+              fun restoreMultipleFromVault(activity: Activity, vaultFiles: List<File>, onComplete: () -> Unit) {
+                  if (vaultFiles.isEmpty()) return
+                  thread {
+                      var restored = 0
+                      val picturesDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES)
+                      val restoreDir = File(picturesDir, "VaultRestored").apply { mkdirs() }
+                      val scanned = mutableListOf<String>()
+                      for (vaultFile in vaultFiles) {
+                          try {
+                              val cleanName = vaultFile.name.substringAfter("_", vaultFile.name)
+                              var dest = File(restoreDir, cleanName)
+                              if (dest.exists()) {
+                                  dest = File(restoreDir, "${System.currentTimeMillis()}_$cleanName")
+                              }
+                              FileInputStream(vaultFile).use { input ->
+                                  FileOutputStream(dest).use { output ->
+                                      input.copyTo(output)
+                                  }
+                              }
+                              if (dest.exists() && dest.length() == vaultFile.length()) {
+                                  vaultFile.delete()
+                                  scanned.add(dest.absolutePath)
+                                  restored++
+                              } else {
+                                  dest.delete()
+                              }
+                          } catch (_: Throwable) {
+                          }
+                      }
+                      if (scanned.isNotEmpty()) {
+                          MediaScannerConnection.scanFile(activity, scanned.toTypedArray(), null, null)
+                      }
+                      activity.runOnUiThread {
+                          Toast.makeText(
+                              activity,
+                              "Restored $restored ${if (restored == 1) "item" else "items"} to Pictures/VaultRestored",
+                              Toast.LENGTH_SHORT,
+                          ).show()
+                          onComplete()
                       }
                   }
               }
@@ -638,6 +681,9 @@ jobs:
 
               private var isDecoy = false
               private lateinit var gridContainer: LinearLayout
+              private lateinit var normalTopBar: LinearLayout
+              private lateinit var selectionTopBar: LinearLayout
+              private lateinit var selectionTitle: TextView
               private lateinit var gridView: GridView
               private lateinit var emptyLabel: TextView
               private lateinit var viewerContainer: FrameLayout
@@ -646,6 +692,8 @@ jobs:
               private lateinit var viewerBottomBar: LinearLayout
               private lateinit var viewerCounter: TextView
               private var vaultFiles: List<File> = emptyList()
+              private val selectedPaths = LinkedHashSet<String>()
+              private var selectionMode = false
               private var pickingExternal = false
               private var viewerBarsVisible = true
               private var activeVideoView: VideoView? = null
@@ -717,7 +765,7 @@ jobs:
                       )
                   }
 
-                  val topBar = LinearLayout(this).apply {
+                  normalTopBar = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
                       setPadding(24, 48, 24, 24)
@@ -741,19 +789,60 @@ jobs:
                       setOnClickListener { finish() }
                   }
 
-                  topBar.addView(title)
-                  topBar.addView(addBtn)
+                  normalTopBar.addView(title)
+                  normalTopBar.addView(addBtn)
                   if (!isDecoy) {
                       val pinBtn = Button(this).apply {
                           text = "PIN"
                           setOnClickListener { VaultManager.promptChangePasscodes(this@VaultActivity) }
                       }
-                      topBar.addView(pinBtn)
+                      normalTopBar.addView(pinBtn)
                   }
-                  topBar.addView(lockBtn)
+                  normalTopBar.addView(lockBtn)
+
+                  selectionTopBar = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(16, 48, 16, 24)
+                      setBackgroundColor(Color.parseColor("#263238"))
+                      visibility = View.GONE
+                  }
+
+                  selectionTitle = TextView(this).apply {
+                      text = "0 selected"
+                      textSize = 16f
+                      setTextColor(Color.WHITE)
+                      layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  }
+
+                  val selectAllBtn = Button(this).apply {
+                      text = "All"
+                      setOnClickListener { toggleSelectAll() }
+                  }
+
+                  val batchRestoreBtn = Button(this).apply {
+                      text = "Restore"
+                      setOnClickListener { restoreSelectedItems() }
+                  }
+
+                  val batchDeleteBtn = Button(this).apply {
+                      text = "Delete"
+                      setOnClickListener { deleteSelectedItems() }
+                  }
+
+                  val cancelSelBtn = Button(this).apply {
+                      text = "X"
+                      setOnClickListener { exitSelectionMode() }
+                  }
+
+                  selectionTopBar.addView(selectionTitle)
+                  selectionTopBar.addView(selectAllBtn)
+                  selectionTopBar.addView(batchRestoreBtn)
+                  selectionTopBar.addView(batchDeleteBtn)
+                  selectionTopBar.addView(cancelSelBtn)
 
                   emptyLabel = TextView(this).apply {
-                      text = "No hidden items yet.\\nUse '+ Add' or select photos/videos -> Move to Vault."
+                      text = "No hidden items yet.\\nUse '+ Add' or select photos/videos -> Archive."
                       setTextColor(Color.LTGRAY)
                       textSize = 15f
                       gravity = Gravity.CENTER
@@ -771,14 +860,93 @@ jobs:
                           1f,
                       )
                       setOnItemClickListener { _, _, position, _ ->
-                          openFullScreenViewer(position)
+                          if (selectionMode) {
+                              toggleSelectionAt(position)
+                          } else {
+                              openFullScreenViewer(position)
+                          }
+                      }
+                      setOnItemLongClickListener { _, _, position, _ ->
+                          if (!selectionMode) {
+                              selectionMode = true
+                          }
+                          toggleSelectionAt(position)
+                          true
                       }
                   }
 
-                  container.addView(topBar)
+                  container.addView(normalTopBar)
+                  container.addView(selectionTopBar)
                   container.addView(emptyLabel)
                   container.addView(gridView)
                   return container
+              }
+
+              private fun updateSelectionBar() {
+                  if (selectionMode && selectedPaths.isNotEmpty()) {
+                      normalTopBar.visibility = View.GONE
+                      selectionTopBar.visibility = View.VISIBLE
+                      selectionTitle.text = "${selectedPaths.size} selected"
+                  } else {
+                      selectionMode = false
+                      selectedPaths.clear()
+                      selectionTopBar.visibility = View.GONE
+                      normalTopBar.visibility = View.VISIBLE
+                  }
+                  (gridView.adapter as? BaseAdapter)?.notifyDataSetChanged()
+              }
+
+              private fun toggleSelectionAt(position: Int) {
+                  val file = vaultFiles.getOrNull(position) ?: return
+                  val path = file.absolutePath
+                  if (!selectedPaths.add(path)) {
+                      selectedPaths.remove(path)
+                  }
+                  updateSelectionBar()
+              }
+
+              private fun toggleSelectAll() {
+                  if (selectedPaths.size == vaultFiles.size) {
+                      selectedPaths.clear()
+                  } else {
+                      selectedPaths.clear()
+                      vaultFiles.forEach { selectedPaths.add(it.absolutePath) }
+                  }
+                  updateSelectionBar()
+              }
+
+              private fun exitSelectionMode() {
+                  selectionMode = false
+                  selectedPaths.clear()
+                  updateSelectionBar()
+              }
+
+              private fun restoreSelectedItems() {
+                  val files = vaultFiles.filter { it.absolutePath in selectedPaths }
+                  if (files.isEmpty()) return
+                  VaultManager.restoreMultipleFromVault(this, files) {
+                      exitSelectionMode()
+                      refreshVaultData()
+                  }
+              }
+
+              private fun deleteSelectedItems() {
+                  val files = vaultFiles.filter { it.absolutePath in selectedPaths }
+                  if (files.isEmpty()) return
+                  AlertDialog.Builder(this)
+                      .setTitle("Delete ${files.size} ${if (files.size == 1) "item" else "items"} permanently?")
+                      .setMessage("Selected items will be permanently deleted from the vault.")
+                      .setPositiveButton("Delete") { _, _ ->
+                          var deleted = 0
+                          files.forEach { file ->
+                              if (file.delete()) deleted++
+                          }
+                          Toast.makeText(this, "Deleted $deleted ${if (deleted == 1) "item" else "items"}", Toast.LENGTH_SHORT).show()
+                          exitSelectionMode()
+                          refreshVaultData()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .show()
               }
 
               private fun buildViewerContainer(): FrameLayout {
@@ -925,10 +1093,10 @@ jobs:
 
               @Deprecated("Deprecated in Java")
               override fun onBackPressed() {
-                  if (viewerContainer.visibility == View.VISIBLE) {
-                      closeFullScreenViewer()
-                  } else {
-                      super.onBackPressed()
+                  when {
+                      viewerContainer.visibility == View.VISIBLE -> closeFullScreenViewer()
+                      selectionMode -> exitSelectionMode()
+                      else -> super.onBackPressed()
                   }
               }
 
@@ -1016,13 +1184,30 @@ jobs:
                                   Gravity.BOTTOM or Gravity.END,
                               )
                           }
+                          val checkOverlay = TextView(this@VaultActivity).apply {
+                              text = "✓"
+                              textSize = 16f
+                              setTextColor(Color.WHITE)
+                              setBackgroundColor(Color.parseColor("#CC1976D2"))
+                              setPadding(14, 6, 14, 6)
+                              layoutParams = FrameLayout.LayoutParams(
+                                  FrameLayout.LayoutParams.WRAP_CONTENT,
+                                  FrameLayout.LayoutParams.WRAP_CONTENT,
+                                  Gravity.TOP or Gravity.END,
+                              )
+                          }
                           addView(iv)
                           addView(badge)
+                          addView(checkOverlay)
                       }
                       val file = items[position]
                       val iv = tile.getChildAt(0) as ImageView
                       val badge = tile.getChildAt(1) as TextView
+                      val checkOverlay = tile.getChildAt(2) as TextView
+                      val isSelected = file.absolutePath in selectedPaths
                       badge.visibility = if (VaultManager.isVideoFile(file)) View.VISIBLE else View.GONE
+                      checkOverlay.visibility = if (isSelected) View.VISIBLE else View.GONE
+                      iv.alpha = if (isSelected) 0.55f else 1.0f
                       Glide.with(this@VaultActivity).load(file).centerCrop().into(iv)
                       return tile
                   }
@@ -1192,7 +1377,8 @@ jobs:
                   raise RuntimeError("Could not locate groupMedia() in MediaFetcher.kt")
               param_media, param_path = m.group(1), m.group(2)
               guard = (
-                  f"\n        val noDateGrouping = context.config.getFolderGrouping({param_path})\n"
+                  f"\n        val noDatePath = if ({param_path}.isEmpty()) SHOW_ALL else {param_path}\n"
+                  f"        val noDateGrouping = context.config.getFolderGrouping(noDatePath)\n"
                   f"        if ((noDateGrouping and (GROUP_BY_DATE_TAKEN_DAILY or GROUP_BY_DATE_TAKEN_MONTHLY "
                   f"or GROUP_BY_LAST_MODIFIED_DAILY or GROUP_BY_LAST_MODIFIED_MONTHLY)) != 0) {{\n"
                   f"            return ArrayList({param_media})\n"
@@ -1205,6 +1391,14 @@ jobs:
                   code,
                   count=1,
               )
+              code, final_hits = re.subn(
+                  r"(fun\s+getFinalDate\s*\([^)]*\)[^{]*\{)",
+                  r'\1\n        return ""',
+                  code,
+                  count=1,
+              )
+              if final_hits == 0:
+                  raise RuntimeError("Could not locate getFinalDate() in MediaFetcher.kt")
               write_file(path, code)
               print(f"Patched {path} (groupMedia guarded, formatDate hits={fmt_hits})")
 
@@ -1287,7 +1481,7 @@ jobs:
                   ROOT / "activities/ViewPagerActivity.kt",
                   "binding.mediumViewerToolbar.menu",
                   991002,
-                  "Move to Vault",
+                  "Archive",
                   "getCurrentMedium()?.path?.let { p -> VaultManager.moveToVault(this, p) { finish() } }",
               )
 
@@ -1324,7 +1518,7 @@ jobs:
                   raise RuntimeError(f"Could not locate isInRecycleBin in {path}")
               add_item = (
                   "        if (menu.findItem(991004) == null) {\n"
-                  "            menu.add(0, 991004, 0, \"Move to Vault\")\n"
+                  "            menu.add(0, 991004, 0, \"Archive\")\n"
                   "        }\n"
                   "        menu.findItem(991004)?.isVisible = !isInRecycleBin\n"
               )
