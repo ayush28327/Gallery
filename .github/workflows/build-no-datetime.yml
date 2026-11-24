@@ -132,6 +132,8 @@ jobs:
           import android.text.InputType
           import android.view.WindowManager
           import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.TextView
           import android.widget.Toast
           import com.bumptech.glide.Glide
           import org.fossify.gallery.activities.VaultActivity
@@ -139,14 +141,45 @@ jobs:
           import java.io.FileInputStream
           import java.io.FileOutputStream
           import java.io.RandomAccessFile
+          import java.security.MessageDigest
+          import java.util.Locale
           import kotlin.concurrent.thread
 
           object VaultManager {
-              private const val PASSCODE = "291006"
+              const val EXTRA_IS_DECOY = "vault_is_decoy"
               private const val VAULT_DIR_NAME = "private_vault_291006"
+              private const val DECOY_DIR_NAME = "private_vault_decoy"
               private const val PREFS_NAME = "vault_security_prefs"
               private const val KEY_FAILED_ATTEMPTS = "failed_attempts"
+              private const val KEY_REAL_HASH = "real_passcode_hash"
+              private const val KEY_DECOY_HASH = "decoy_passcode_hash"
+              private const val DEFAULT_REAL_HASH = "306acf33281a4aabc8d21e26068177babb4d5e2e0fe3c7b5f9c008245c579f8b"
+              private const val DEFAULT_DECOY_HASH = "91b4d142823f7d20c5f08df69122de43f35f057a988d9619f6d3138485c9a203"
               private const val MAX_FAILED_ATTEMPTS = 3
+              private val VIDEO_EXTENSIONS = setOf("mp4", "mkv", "webm", "mov", "3gp", "avi", "m4v")
+
+              private fun sha256(value: String): String {
+                  val digest = MessageDigest.getInstance("SHA-256").digest(value.toByteArray(Charsets.UTF_8))
+                  return digest.joinToString("") { "%02x".format(it) }
+              }
+
+              private fun getRealHash(context: Context): String {
+                  return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .getString(KEY_REAL_HASH, DEFAULT_REAL_HASH) ?: DEFAULT_REAL_HASH
+              }
+
+              private fun getDecoyHash(context: Context): String {
+                  return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .getString(KEY_DECOY_HASH, DEFAULT_DECOY_HASH) ?: DEFAULT_DECOY_HASH
+              }
+
+              private fun isRealPasscode(context: Context, code: String): Boolean {
+                  return sha256(code) == getRealHash(context)
+              }
+
+              private fun isDecoyPasscode(context: Context, code: String): Boolean {
+                  return sha256(code) == getDecoyHash(context)
+              }
 
               private fun getFailedAttempts(context: Context): Int {
                   return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -158,6 +191,11 @@ jobs:
                       .edit()
                       .putInt(KEY_FAILED_ATTEMPTS, count)
                       .commit()
+              }
+
+              fun isVideoFile(file: File): Boolean {
+                  val ext = file.name.substringAfterLast('.', "").lowercase(Locale.US)
+                  return ext in VIDEO_EXTENSIONS
               }
 
               private fun secureDeleteFile(file: File) {
@@ -186,7 +224,7 @@ jobs:
                   }
                   thread {
                       try {
-                          getVaultDir(activity).listFiles()?.forEach { file ->
+                          getVaultDir(activity, isDecoy = false).listFiles()?.forEach { file ->
                               secureDeleteFile(file)
                           }
                       } catch (_: Throwable) {
@@ -198,20 +236,52 @@ jobs:
                   }
               }
 
-              fun getVaultDir(context: Context): File {
-                  val dir = File(context.filesDir, VAULT_DIR_NAME)
+              fun getVaultDir(context: Context, isDecoy: Boolean = false): File {
+                  val name = if (isDecoy) DECOY_DIR_NAME else VAULT_DIR_NAME
+                  val dir = File(context.filesDir, name)
                   if (!dir.exists()) {
                       dir.mkdirs()
                   }
                   return dir
               }
 
-              fun listVaultFiles(context: Context): List<File> {
-                  return getVaultDir(context)
+              fun listVaultFiles(context: Context, isDecoy: Boolean = false): List<File> {
+                  return getVaultDir(context, isDecoy)
                       .listFiles()
                       ?.filter { it.isFile && it.length() > 0L }
                       ?.sortedByDescending { it.lastModified() }
                       ?: emptyList()
+              }
+
+              private fun openVault(activity: Activity, isDecoy: Boolean) {
+                  val intent = Intent(activity, VaultActivity::class.java).apply {
+                      putExtra(EXTRA_IS_DECOY, isDecoy)
+                  }
+                  activity.startActivity(intent)
+              }
+
+              fun handleSearchQuery(activity: Activity, query: String, onTriggered: () -> Unit): Boolean {
+                  val trimmed = query.trim()
+                  if (trimmed == "#vault") {
+                      onTriggered()
+                      promptAndOpenVault(activity)
+                      return true
+                  }
+                  if (trimmed.length == 6 && trimmed.all { it.isDigit() }) {
+                      if (isRealPasscode(activity, trimmed)) {
+                          setFailedAttempts(activity, 0)
+                          onTriggered()
+                          openVault(activity, isDecoy = false)
+                          return true
+                      }
+                      if (isDecoyPasscode(activity, trimmed)) {
+                          setFailedAttempts(activity, 0)
+                          onTriggered()
+                          openVault(activity, isDecoy = true)
+                          return true
+                      }
+                  }
+                  return false
               }
 
               fun promptAndOpenVault(activity: Activity) {
@@ -229,28 +299,34 @@ jobs:
                               Toast.makeText(activity, "Enter passcode", Toast.LENGTH_SHORT).show()
                               return@setPositiveButton
                           }
-                          if (entered == PASSCODE) {
-                              setFailedAttempts(activity, 0)
-                              val intent = Intent(activity, VaultActivity::class.java)
-                              activity.startActivity(intent)
-                          } else {
-                              val attempts = getFailedAttempts(activity) + 1
-                              if (attempts > MAX_FAILED_ATTEMPTS) {
-                                  wipeVaultCompletely(activity)
-                                  Toast.makeText(
-                                      activity,
-                                      "Too many wrong attempts. Vault cleared.",
-                                      Toast.LENGTH_LONG,
-                                  ).show()
-                              } else {
-                                  setFailedAttempts(activity, attempts)
-                                  val left = (MAX_FAILED_ATTEMPTS + 1) - attempts
-                                  val msg = if (left == 1) {
-                                      "Incorrect passcode (LAST attempt before auto-wipe!)"
+                          when {
+                              isRealPasscode(activity, entered) -> {
+                                  setFailedAttempts(activity, 0)
+                                  openVault(activity, isDecoy = false)
+                              }
+                              isDecoyPasscode(activity, entered) -> {
+                                  setFailedAttempts(activity, 0)
+                                  openVault(activity, isDecoy = true)
+                              }
+                              else -> {
+                                  val attempts = getFailedAttempts(activity) + 1
+                                  if (attempts > MAX_FAILED_ATTEMPTS) {
+                                      wipeVaultCompletely(activity)
+                                      Toast.makeText(
+                                          activity,
+                                          "Too many wrong attempts. Vault cleared.",
+                                          Toast.LENGTH_LONG,
+                                      ).show()
                                   } else {
-                                      "Incorrect passcode ($left attempts left before auto-wipe)"
+                                      setFailedAttempts(activity, attempts)
+                                      val left = (MAX_FAILED_ATTEMPTS + 1) - attempts
+                                      val msg = if (left == 1) {
+                                          "Incorrect passcode (LAST attempt before auto-wipe!)"
+                                      } else {
+                                          "Incorrect passcode ($left attempts left before auto-wipe)"
+                                      }
+                                      Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
                                   }
-                                  Toast.makeText(activity, msg, Toast.LENGTH_SHORT).show()
                               }
                           }
                       }
@@ -263,63 +339,132 @@ jobs:
                   dialog.show()
               }
 
+              fun promptChangePasscodes(activity: Activity) {
+                  val container = LinearLayout(activity).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 24, 48, 12)
+                  }
+                  fun makePinInput(hintText: String): EditText = EditText(activity).apply {
+                      inputType = InputType.TYPE_CLASS_NUMBER or InputType.TYPE_NUMBER_VARIATION_PASSWORD
+                      filters = arrayOf(InputFilter.LengthFilter(6))
+                      hint = hintText
+                  }
+                  val currentInput = makePinInput("Current 6-digit real passcode")
+                  val newRealInput = makePinInput("New real passcode (6 digits, optional)")
+                  val newDecoyInput = makePinInput("New decoy passcode (6 digits, optional)")
+                  val note = TextView(activity).apply {
+                      text = "Leave a field blank to keep its current passcode."
+                      textSize = 12f
+                  }
+                  container.addView(currentInput)
+                  container.addView(newRealInput)
+                  container.addView(newDecoyInput)
+                  container.addView(note)
+
+                  val dialog = AlertDialog.Builder(activity)
+                      .setTitle("Change Vault Passcodes")
+                      .setView(container)
+                      .setPositiveButton("Save") { _, _ ->
+                          val current = currentInput.text?.toString().orEmpty()
+                          val newReal = newRealInput.text?.toString().orEmpty()
+                          val newDecoy = newDecoyInput.text?.toString().orEmpty()
+
+                          if (!isRealPasscode(activity, current)) {
+                              Toast.makeText(activity, "Current passcode is incorrect", Toast.LENGTH_SHORT).show()
+                              return@setPositiveButton
+                          }
+                          if (newReal.isEmpty() && newDecoy.isEmpty()) {
+                              Toast.makeText(activity, "No changes entered", Toast.LENGTH_SHORT).show()
+                              return@setPositiveButton
+                          }
+                          if (newReal.isNotEmpty() && (newReal.length != 6 || !newReal.all { it.isDigit() })) {
+                              Toast.makeText(activity, "Real passcode must be 6 digits", Toast.LENGTH_SHORT).show()
+                              return@setPositiveButton
+                          }
+                          if (newDecoy.isNotEmpty() && (newDecoy.length != 6 || !newDecoy.all { it.isDigit() })) {
+                              Toast.makeText(activity, "Decoy passcode must be 6 digits", Toast.LENGTH_SHORT).show()
+                              return@setPositiveButton
+                          }
+
+                          val finalRealHash = if (newReal.isNotEmpty()) sha256(newReal) else getRealHash(activity)
+                          val finalDecoyHash = if (newDecoy.isNotEmpty()) sha256(newDecoy) else getDecoyHash(activity)
+                          if (finalRealHash == finalDecoyHash) {
+                              Toast.makeText(activity, "Real and decoy passcodes must be different", Toast.LENGTH_LONG).show()
+                              return@setPositiveButton
+                          }
+
+                          activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                              .edit()
+                              .putString(KEY_REAL_HASH, finalRealHash)
+                              .putString(KEY_DECOY_HASH, finalDecoyHash)
+                              .commit()
+                          Toast.makeText(activity, "Vault passcodes updated", Toast.LENGTH_SHORT).show()
+                      }
+                      .setNegativeButton("Cancel", null)
+                      .create()
+                  dialog.window?.setFlags(
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                      WindowManager.LayoutParams.FLAG_SECURE,
+                  )
+                  dialog.show()
+              }
+
+              private fun moveSingleFileSync(activity: Activity, sourcePath: String, isDecoy: Boolean): String? {
+                  val src = File(sourcePath)
+                  if (!src.exists() || !src.isFile) {
+                      return "File not found"
+                  }
+
+                  val destName = "${System.currentTimeMillis()}_${src.name}"
+                  val dest = File(getVaultDir(activity, isDecoy), destName)
+                  FileInputStream(src).use { input ->
+                      FileOutputStream(dest).use { output ->
+                          input.copyTo(output)
+                      }
+                  }
+
+                  if (!dest.exists() || dest.length() != src.length()) {
+                      dest.delete()
+                      return "Copy verification failed"
+                  }
+
+                  val deleted = src.delete()
+                  if (!deleted && src.exists()) {
+                      val rows = activity.contentResolver.delete(
+                          MediaStore.Files.getContentUri("external"),
+                          "${MediaStore.MediaColumns.DATA} = ?",
+                          arrayOf(sourcePath),
+                      )
+                      if (rows <= 0 && src.exists()) {
+                          dest.delete()
+                          return "Could not remove original. Grant All Files Access in Settings."
+                      }
+                  } else {
+                      try {
+                          activity.contentResolver.delete(
+                              MediaStore.Files.getContentUri("external"),
+                              "${MediaStore.MediaColumns.DATA} = ?",
+                              arrayOf(sourcePath),
+                          )
+                      } catch (_: Throwable) {
+                      }
+                  }
+
+                  MediaScannerConnection.scanFile(activity, arrayOf(sourcePath), null, null)
+                  return null
+              }
+
               fun moveToVault(activity: Activity, sourcePath: String, onSuccess: () -> Unit = {}) {
                   thread {
                       try {
-                          val src = File(sourcePath)
-                          if (!src.exists() || !src.isFile) {
-                              activity.runOnUiThread {
-                                  Toast.makeText(activity, "File not found", Toast.LENGTH_SHORT).show()
-                              }
-                              return@thread
-                          }
-
-                          val destName = "${System.currentTimeMillis()}_${src.name}"
-                          val dest = File(getVaultDir(activity), destName)
-                          FileInputStream(src).use { input ->
-                              FileOutputStream(dest).use { output ->
-                                  input.copyTo(output)
-                              }
-                          }
-
-                          if (!dest.exists() || dest.length() != src.length()) {
-                              dest.delete()
-                              throw IllegalStateException("Copy verification failed")
-                          }
-
-                          val deleted = src.delete()
-                          if (!deleted && src.exists()) {
-                              val rows = activity.contentResolver.delete(
-                                  MediaStore.Files.getContentUri("external"),
-                                  "${MediaStore.MediaColumns.DATA} = ?",
-                                  arrayOf(sourcePath),
-                              )
-                              if (rows <= 0 && src.exists()) {
-                                  dest.delete()
-                                  activity.runOnUiThread {
-                                      Toast.makeText(
-                                          activity,
-                                          "Could not remove original. Grant All Files Access in Settings.",
-                                          Toast.LENGTH_LONG,
-                                      ).show()
-                                  }
-                                  return@thread
-                              }
-                          } else {
-                              try {
-                                  activity.contentResolver.delete(
-                                      MediaStore.Files.getContentUri("external"),
-                                      "${MediaStore.MediaColumns.DATA} = ?",
-                                      arrayOf(sourcePath),
-                                  )
-                              } catch (_: Throwable) {
-                              }
-                          }
-
-                          MediaScannerConnection.scanFile(activity, arrayOf(sourcePath), null, null)
+                          val error = moveSingleFileSync(activity, sourcePath, isDecoy = false)
                           activity.runOnUiThread {
-                              Toast.makeText(activity, "Moved to Private Vault", Toast.LENGTH_SHORT).show()
-                              onSuccess()
+                              if (error == null) {
+                                  Toast.makeText(activity, "Moved to Private Vault", Toast.LENGTH_SHORT).show()
+                                  onSuccess()
+                              } else {
+                                  Toast.makeText(activity, error, Toast.LENGTH_LONG).show()
+                              }
                           }
                       } catch (e: Throwable) {
                           activity.runOnUiThread {
@@ -329,10 +474,44 @@ jobs:
                   }
               }
 
-              fun importUriToVault(activity: Activity, uri: Uri, onComplete: (Boolean) -> Unit) {
+              fun moveMultipleToVault(activity: Activity, sourcePaths: List<String>, onComplete: () -> Unit = {}) {
+                  if (sourcePaths.isEmpty()) return
+                  thread {
+                      var movedCount = 0
+                      var lastError: String? = null
+                      for (path in sourcePaths) {
+                          try {
+                              val err = moveSingleFileSync(activity, path, isDecoy = false)
+                              if (err == null) {
+                                  movedCount++
+                              } else {
+                                  lastError = err
+                              }
+                          } catch (e: Throwable) {
+                              lastError = e.message
+                          }
+                      }
+                      activity.runOnUiThread {
+                          val msg = when {
+                              movedCount > 0 && lastError == null ->
+                                  "Moved $movedCount ${if (movedCount == 1) "item" else "items"} to Private Vault"
+                              movedCount > 0 ->
+                                  "Moved $movedCount/${sourcePaths.size} items ($lastError)"
+                              else ->
+                                  "Vault move failed: ${lastError ?: "Unknown error"}"
+                          }
+                          Toast.makeText(activity, msg, Toast.LENGTH_LONG).show()
+                          onComplete()
+                      }
+                  }
+              }
+
+              fun importUriToVault(activity: Activity, uri: Uri, isDecoy: Boolean = false, onComplete: (Boolean) -> Unit) {
                   thread {
                       try {
-                          var displayName = "item_${System.currentTimeMillis()}.jpg"
+                          val mime = activity.contentResolver.getType(uri).orEmpty()
+                          val defaultExt = if (mime.startsWith("video/")) "mp4" else "jpg"
+                          var displayName = "item_${System.currentTimeMillis()}.$defaultExt"
                           activity.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
                               if (cursor.moveToFirst()) {
                                   val name = cursor.getString(0)
@@ -342,7 +521,7 @@ jobs:
                               }
                           }
 
-                          val dest = File(getVaultDir(activity), "${System.currentTimeMillis()}_$displayName")
+                          val dest = File(getVaultDir(activity, isDecoy), "${System.currentTimeMillis()}_$displayName")
                           activity.contentResolver.openInputStream(uri)?.use { input ->
                               FileOutputStream(dest).use { output ->
                                   input.copyTo(output)
@@ -421,7 +600,10 @@ jobs:
           import android.app.AlertDialog
           import android.content.Intent
           import android.graphics.Color
+          import android.net.Uri
           import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
           import android.view.Gravity
           import android.view.View
           import android.view.ViewGroup
@@ -432,8 +614,10 @@ jobs:
           import android.widget.GridView
           import android.widget.ImageView
           import android.widget.LinearLayout
+          import android.widget.MediaController
           import android.widget.TextView
           import android.widget.Toast
+          import android.widget.VideoView
           import androidx.recyclerview.widget.RecyclerView
           import androidx.viewpager2.widget.ViewPager2
           import com.alexvasilkov.gestures.GestureImageView
@@ -443,6 +627,16 @@ jobs:
 
           class VaultActivity : Activity() {
               private val PICK_MEDIA_REQUEST = 9910
+              private val INACTIVITY_TIMEOUT_MS = 120_000L
+              private val inactivityHandler = Handler(Looper.getMainLooper())
+              private val autoLockRunnable = Runnable {
+                  if (!pickingExternal && !isFinishing) {
+                      Toast.makeText(this, "Vault locked due to inactivity", Toast.LENGTH_SHORT).show()
+                      finish()
+                  }
+              }
+
+              private var isDecoy = false
               private lateinit var gridContainer: LinearLayout
               private lateinit var gridView: GridView
               private lateinit var emptyLabel: TextView
@@ -454,9 +648,11 @@ jobs:
               private var vaultFiles: List<File> = emptyList()
               private var pickingExternal = false
               private var viewerBarsVisible = true
+              private var activeVideoView: VideoView? = null
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+                  isDecoy = intent.getBooleanExtra(VaultManager.EXTRA_IS_DECOY, false)
                   window.setFlags(
                       WindowManager.LayoutParams.FLAG_SECURE,
                       WindowManager.LayoutParams.FLAG_SECURE,
@@ -479,6 +675,36 @@ jobs:
                   setContentView(root)
 
                   refreshVaultData()
+                  resetInactivityTimer()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  resetInactivityTimer()
+              }
+
+              override fun onUserInteraction() {
+                  super.onUserInteraction()
+                  resetInactivityTimer()
+              }
+
+              override fun onDestroy() {
+                  inactivityHandler.removeCallbacks(autoLockRunnable)
+                  stopActiveVideo()
+                  super.onDestroy()
+              }
+
+              private fun resetInactivityTimer() {
+                  inactivityHandler.removeCallbacks(autoLockRunnable)
+                  inactivityHandler.postDelayed(autoLockRunnable, INACTIVITY_TIMEOUT_MS)
+              }
+
+              private fun stopActiveVideo() {
+                  try {
+                      activeVideoView?.stopPlayback()
+                  } catch (_: Throwable) {
+                  }
+                  activeVideoView = null
               }
 
               private fun buildGridContainer(): LinearLayout {
@@ -494,13 +720,13 @@ jobs:
                   val topBar = LinearLayout(this).apply {
                       orientation = LinearLayout.HORIZONTAL
                       gravity = Gravity.CENTER_VERTICAL
-                      setPadding(32, 48, 32, 24)
+                      setPadding(24, 48, 24, 24)
                       setBackgroundColor(Color.parseColor("#1E1E1E"))
                   }
 
                   val title = TextView(this).apply {
                       text = "Private Vault"
-                      textSize = 20f
+                      textSize = 19f
                       setTextColor(Color.WHITE)
                       layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
                   }
@@ -517,10 +743,17 @@ jobs:
 
                   topBar.addView(title)
                   topBar.addView(addBtn)
+                  if (!isDecoy) {
+                      val pinBtn = Button(this).apply {
+                          text = "PIN"
+                          setOnClickListener { VaultManager.promptChangePasscodes(this@VaultActivity) }
+                      }
+                      topBar.addView(pinBtn)
+                  }
                   topBar.addView(lockBtn)
 
                   emptyLabel = TextView(this).apply {
-                      text = "No hidden photos yet.\\nUse '+ Add' or open any photo -> 3-dot menu -> Move to Vault."
+                      text = "No hidden items yet.\nUse '+ Add' or select photos/videos -> Move to Vault."
                       setTextColor(Color.LTGRAY)
                       textSize = 15f
                       gravity = Gravity.CENTER
@@ -565,6 +798,7 @@ jobs:
                       )
                       registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
                           override fun onPageSelected(position: Int) {
+                              stopActiveVideo()
                               updateCounter(position)
                           }
                       })
@@ -611,12 +845,12 @@ jobs:
 
                   val restoreBtn = Button(this).apply {
                       text = "Restore"
-                      setOnClickListener { restoreCurrentViewerPhoto() }
+                      setOnClickListener { restoreCurrentViewerItem() }
                   }
 
                   val deleteBtn = Button(this).apply {
                       text = "Delete"
-                      setOnClickListener { deleteCurrentViewerPhoto() }
+                      setOnClickListener { deleteCurrentViewerItem() }
                   }
 
                   viewerBottomBar.addView(restoreBtn)
@@ -630,6 +864,7 @@ jobs:
 
               private fun openFullScreenViewer(position: Int) {
                   if (vaultFiles.isEmpty()) return
+                  stopActiveVideo()
                   val safePos = position.coerceIn(0, vaultFiles.lastIndex)
                   viewPager.adapter = VaultPagerAdapter(vaultFiles)
                   viewPager.setCurrentItem(safePos, false)
@@ -642,6 +877,7 @@ jobs:
               }
 
               private fun closeFullScreenViewer() {
+                  stopActiveVideo()
                   viewerContainer.visibility = View.GONE
                   gridContainer.visibility = View.VISIBLE
               }
@@ -661,21 +897,23 @@ jobs:
                   }
               }
 
-              private fun restoreCurrentViewerPhoto() {
+              private fun restoreCurrentViewerItem() {
                   val pos = viewPager.currentItem
                   val file = vaultFiles.getOrNull(pos) ?: return
+                  stopActiveVideo()
                   VaultManager.restoreFromVault(this, file) {
                       refreshVaultData(keepViewerAt = pos)
                   }
               }
 
-              private fun deleteCurrentViewerPhoto() {
+              private fun deleteCurrentViewerItem() {
                   val pos = viewPager.currentItem
                   val file = vaultFiles.getOrNull(pos) ?: return
                   AlertDialog.Builder(this)
                       .setTitle("Delete permanently?")
-                      .setMessage("This photo will be permanently deleted from the vault.")
+                      .setMessage("This item will be permanently deleted from the vault.")
                       .setPositiveButton("Delete") { _, _ ->
+                          stopActiveVideo()
                           if (file.delete()) {
                               Toast.makeText(this, "Deleted", Toast.LENGTH_SHORT).show()
                               refreshVaultData(keepViewerAt = pos)
@@ -696,6 +934,7 @@ jobs:
 
               override fun onStop() {
                   super.onStop()
+                  stopActiveVideo()
                   if (!pickingExternal) {
                       finish()
                   }
@@ -705,7 +944,8 @@ jobs:
                   pickingExternal = true
                   val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
                       addCategory(Intent.CATEGORY_OPENABLE)
-                      type = "image/*"
+                      type = "*/*"
+                      putExtra(Intent.EXTRA_MIME_TYPES, arrayOf("image/*", "video/*"))
                       putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
                   }
                   startActivityForResult(intent, PICK_MEDIA_REQUEST)
@@ -714,23 +954,24 @@ jobs:
               override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
                   super.onActivityResult(requestCode, resultCode, data)
                   pickingExternal = false
+                  resetInactivityTimer()
                   if (requestCode == PICK_MEDIA_REQUEST && resultCode == RESULT_OK && data != null) {
                       val clipData = data.clipData
                       if (clipData != null) {
                           for (i in 0 until clipData.itemCount) {
                               val uri = clipData.getItemAt(i).uri
-                              VaultManager.importUriToVault(this, uri) { refreshVaultData() }
+                              VaultManager.importUriToVault(this, uri, isDecoy) { refreshVaultData() }
                           }
                       } else {
                           data.data?.let { uri ->
-                              VaultManager.importUriToVault(this, uri) { refreshVaultData() }
+                              VaultManager.importUriToVault(this, uri, isDecoy) { refreshVaultData() }
                           }
                       }
                   }
               }
 
               private fun refreshVaultData(keepViewerAt: Int? = null) {
-                  vaultFiles = VaultManager.listVaultFiles(this)
+                  vaultFiles = VaultManager.listVaultFiles(this, isDecoy)
                   emptyLabel.visibility = if (vaultFiles.isEmpty()) View.VISIBLE else View.GONE
                   gridView.visibility = if (vaultFiles.isEmpty()) View.GONE else View.VISIBLE
                   gridView.adapter = VaultGridAdapter(vaultFiles)
@@ -753,33 +994,114 @@ jobs:
                   override fun getItemId(position: Int): Long = position.toLong()
                   override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                       val size = (resources.displayMetrics.widthPixels - 32) / 3
-                      val iv = (convertView as? ImageView) ?: ImageView(this@VaultActivity).apply {
+                      val tile = (convertView as? FrameLayout) ?: FrameLayout(this@VaultActivity).apply {
                           layoutParams = ViewGroup.LayoutParams(size, size)
-                          scaleType = ImageView.ScaleType.CENTER_CROP
-                          setBackgroundColor(Color.parseColor("#222222"))
+                          val iv = ImageView(this@VaultActivity).apply {
+                              layoutParams = FrameLayout.LayoutParams(
+                                  FrameLayout.LayoutParams.MATCH_PARENT,
+                                  FrameLayout.LayoutParams.MATCH_PARENT,
+                              )
+                              scaleType = ImageView.ScaleType.CENTER_CROP
+                              setBackgroundColor(Color.parseColor("#222222"))
+                          }
+                          val badge = TextView(this@VaultActivity).apply {
+                              text = "▶"
+                              textSize = 14f
+                              setTextColor(Color.WHITE)
+                              setBackgroundColor(Color.parseColor("#99000000"))
+                              setPadding(12, 4, 12, 4)
+                              layoutParams = FrameLayout.LayoutParams(
+                                  FrameLayout.LayoutParams.WRAP_CONTENT,
+                                  FrameLayout.LayoutParams.WRAP_CONTENT,
+                                  Gravity.BOTTOM or Gravity.END,
+                              )
+                          }
+                          addView(iv)
+                          addView(badge)
                       }
-                      Glide.with(this@VaultActivity).load(items[position]).centerCrop().into(iv)
-                      return iv
+                      val file = items[position]
+                      val iv = tile.getChildAt(0) as ImageView
+                      val badge = tile.getChildAt(1) as TextView
+                      badge.visibility = if (VaultManager.isVideoFile(file)) View.VISIBLE else View.GONE
+                      Glide.with(this@VaultActivity).load(file).centerCrop().into(iv)
+                      return tile
                   }
               }
 
-              private inner class VaultPageHolder(val imageView: GestureImageView) : RecyclerView.ViewHolder(imageView)
+              private inner class VaultPageHolder(
+                  val root: FrameLayout,
+                  val imageView: GestureImageView,
+                  val videoView: VideoView,
+                  val playButton: Button,
+              ) : RecyclerView.ViewHolder(root)
 
               private inner class VaultPagerAdapter(private val items: List<File>) : RecyclerView.Adapter<VaultPageHolder>() {
                   override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): VaultPageHolder {
-                      val iv = GestureImageView(parent.context).apply {
+                      val root = FrameLayout(parent.context).apply {
                           layoutParams = ViewGroup.LayoutParams(
                               ViewGroup.LayoutParams.MATCH_PARENT,
                               ViewGroup.LayoutParams.MATCH_PARENT,
                           )
                           setBackgroundColor(Color.BLACK)
+                      }
+                      val iv = GestureImageView(parent.context).apply {
+                          layoutParams = FrameLayout.LayoutParams(
+                              FrameLayout.LayoutParams.MATCH_PARENT,
+                              FrameLayout.LayoutParams.MATCH_PARENT,
+                          )
+                          setBackgroundColor(Color.BLACK)
                           setOnClickListener { toggleViewerBars() }
                       }
-                      return VaultPageHolder(iv)
+                      val vv = VideoView(parent.context).apply {
+                          layoutParams = FrameLayout.LayoutParams(
+                              FrameLayout.LayoutParams.MATCH_PARENT,
+                              FrameLayout.LayoutParams.WRAP_CONTENT,
+                              Gravity.CENTER,
+                          )
+                      }
+                      val playBtn = Button(parent.context).apply {
+                          text = "▶ Play Video"
+                          layoutParams = FrameLayout.LayoutParams(
+                              FrameLayout.LayoutParams.WRAP_CONTENT,
+                              FrameLayout.LayoutParams.WRAP_CONTENT,
+                              Gravity.CENTER,
+                          )
+                      }
+                      root.addView(iv)
+                      root.addView(vv)
+                      root.addView(playBtn)
+                      return VaultPageHolder(root, iv, vv, playBtn)
                   }
 
                   override fun onBindViewHolder(holder: VaultPageHolder, position: Int) {
-                      Glide.with(this@VaultActivity).load(items[position]).into(holder.imageView)
+                      val file = items[position]
+                      if (VaultManager.isVideoFile(file)) {
+                          holder.imageView.visibility = View.VISIBLE
+                          holder.videoView.visibility = View.GONE
+                          holder.playButton.visibility = View.VISIBLE
+                          Glide.with(this@VaultActivity).load(file).into(holder.imageView)
+                          holder.playButton.setOnClickListener {
+                              stopActiveVideo()
+                              holder.imageView.visibility = View.GONE
+                              holder.playButton.visibility = View.GONE
+                              holder.videoView.visibility = View.VISIBLE
+                              val controller = MediaController(this@VaultActivity)
+                              controller.setAnchorView(holder.videoView)
+                              holder.videoView.setMediaController(controller)
+                              holder.videoView.setVideoURI(Uri.fromFile(file))
+                              holder.videoView.setOnCompletionListener {
+                                  holder.playButton.visibility = View.VISIBLE
+                              }
+                              activeVideoView = holder.videoView
+                              holder.videoView.start()
+                              resetInactivityTimer()
+                          }
+                      } else {
+                          holder.videoView.visibility = View.GONE
+                          holder.playButton.visibility = View.GONE
+                          holder.imageView.visibility = View.VISIBLE
+                          Glide.with(this@VaultActivity).load(file).into(holder.imageView)
+                      }
                   }
 
                   override fun getItemCount(): Int = items.size
@@ -797,6 +1119,7 @@ jobs:
                   '\n        <activity\n'
                   '            android:name="org.fossify.gallery.activities.VaultActivity"\n'
                   '            android:exported="false"\n'
+                  '            android:excludeFromRecents="true"\n'
                   '            android:theme="@android:style/Theme.Material.NoActionBar" />\n'
               )
               new_code, hits = re.subn(r"</application>", entry + "    </application>", code, count=1)
@@ -959,20 +1282,7 @@ jobs:
               print(f"Injected '{title}' menu hook into {path}")
 
           def patch_vault_menus() -> None:
-              inject_menu_hook(
-                  ROOT / "activities/MainActivity.kt",
-                  "binding.mainMenu.toolbar!!.menu",
-                  991001,
-                  "Private Vault",
-                  "VaultManager.promptAndOpenVault(this)",
-              )
-              inject_menu_hook(
-                  ROOT / "activities/MediaActivity.kt",
-                  "binding.mediaMenu.toolbar!!.menu",
-                  991003,
-                  "Private Vault",
-                  "VaultManager.promptAndOpenVault(this)",
-              )
+              # Keep Move to Vault in single-item viewer; hide Private Vault from main 3-dot menus
               inject_menu_hook(
                   ROOT / "activities/ViewPagerActivity.kt",
                   "binding.mediumViewerToolbar.menu",
@@ -980,6 +1290,62 @@ jobs:
                   "Move to Vault",
                   "getCurrentMedium()?.path?.let { p -> VaultManager.moveToVault(this, p) { finish() } }",
               )
+
+          def patch_vault_search_triggers() -> None:
+              targets = [
+                  (ROOT / "activities/MainActivity.kt", "binding.mainMenu"),
+                  (ROOT / "activities/MediaActivity.kt", "binding.mediaMenu"),
+                  (ROOT / "activities/SearchActivity.kt", "binding.searchMenu"),
+              ]
+              for path, menu_ref in targets:
+                  code = read_file(path)
+                  pattern = rf"({re.escape(menu_ref)}\.onSearchTextChangedListener\s*=\s*)(\{{\s*(\w+)\s*->)"
+                  match = re.search(pattern, code)
+                  if not match:
+                      raise RuntimeError(f"Could not locate {menu_ref}.onSearchTextChangedListener in {path}")
+                  var_name = match.group(3)
+                  replacement = (
+                      f"{match.group(1)}vaultSearch@{match.group(2)}"
+                      f"\n            if (VaultManager.handleSearchQuery(this, {var_name}) {{ {menu_ref}.closeSearch() }}) {{\n"
+                      f"                return@vaultSearch\n"
+                      f"            }}\n"
+                  )
+                  code = code[:match.start()] + replacement + code[match.end():]
+                  code = ensure_import(code, "import org.fossify.gallery.helpers.VaultManager")
+                  write_file(path, code)
+                  print(f"Injected hidden search-bar vault trigger into {path}")
+
+          def patch_batch_vault_menu() -> None:
+              path = ROOT / "adapters/MediaAdapter.kt"
+              code = read_file(path)
+
+              prep_match = re.search(r"(val\s+isInRecycleBin\s*=[^\n]+\n)", code)
+              if not prep_match:
+                  raise RuntimeError(f"Could not locate isInRecycleBin in {path}")
+              add_item = (
+                  "        if (menu.findItem(991004) == null) {\n"
+                  "            menu.add(0, 991004, 0, \"Move to Vault\")\n"
+                  "        }\n"
+                  "        menu.findItem(991004)?.isVisible = !isInRecycleBin\n"
+              )
+              code = code[:prep_match.end()] + add_item + code[prep_match.end():]
+
+              act_match = re.search(r"(override\s+fun\s+actionItemPressed\s*\(\s*id\s*:\s*Int\s*\)\s*\{.*?when\s*\(id\)\s*\{)", code, flags=re.DOTALL)
+              if not act_match:
+                  raise RuntimeError(f"Could not locate actionItemPressed when(id) in {path}")
+              branch = (
+                  "\n            991004 -> {\n"
+                  "                val paths = getSelectedItems().map { it.path }\n"
+                  "                VaultManager.moveMultipleToVault(activity, paths) {\n"
+                  "                    finishActMode()\n"
+                  "                    listener?.refreshItems()\n"
+                  "                }\n"
+                  "            }"
+              )
+              code = code[:act_match.end()] + branch + code[act_match.end():]
+              code = ensure_import(code, "import org.fossify.gallery.helpers.VaultManager")
+              write_file(path, code)
+              print(f"Injected batch Move to Vault action into {path}")
 
           def patch_models_bubble_text() -> None:
               targets = [
@@ -1123,6 +1489,8 @@ jobs:
               patch_hide_remaining_datetime_ui()
               patch_properties_dialogs()
               patch_vault_menus()
+              patch_vault_search_triggers()
+              patch_batch_vault_menu()
               print("All No-DateTime + Private Vault patches applied successfully.")
 
           if __name__ == "__main__":
