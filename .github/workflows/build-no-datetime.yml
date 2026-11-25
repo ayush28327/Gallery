@@ -1685,6 +1685,414 @@ jobs:
               write_file(media_adapter, new_code)
               print(f"Patched {media_adapter} (cab_fix_date_taken hidden)")
 
+          def create_metadata_stripper() -> None:
+              helper = ROOT / "helpers/MetadataStripper.kt"
+              content = """package org.fossify.gallery.helpers
+
+          import android.app.Activity
+          import android.content.Context
+          import android.media.ExifInterface
+          import android.media.MediaScannerConnection
+          import android.widget.Toast
+          import java.io.BufferedInputStream
+          import java.io.BufferedOutputStream
+          import java.io.DataInputStream
+          import java.io.DataOutputStream
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.util.Locale
+          import kotlin.concurrent.thread
+
+          object MetadataStripper {
+              private const val PREFS_NAME = "metadata_strip_prefs"
+              private const val KEY_AUTO_STRIP_SHARE = "auto_strip_on_share"
+              private const val SHARE_CACHE_DIR = "clean_share"
+              private val JPEG_EXTS = setOf("jpg", "jpeg")
+              private val PNG_EXTS = setOf("png")
+              private val PNG_KEEP_CHUNKS = setOf("IHDR", "PLTE", "tRNS", "IDAT", "IEND", "sRGB", "gAMA", "cHRM", "iCCP")
+
+              fun isAutoStripOnShareEnabled(context: Context): Boolean {
+                  return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .getBoolean(KEY_AUTO_STRIP_SHARE, true)
+              }
+
+              fun toggleAutoStripOnShare(activity: Activity) {
+                  val next = !isAutoStripOnShareEnabled(activity)
+                  activity.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                      .edit()
+                      .putBoolean(KEY_AUTO_STRIP_SHARE, next)
+                      .commit()
+                  val state = if (next) "ON" else "OFF"
+                  Toast.makeText(activity, "Auto-strip metadata on share: $state", Toast.LENGTH_SHORT).show()
+              }
+
+              private fun getShareCacheDir(context: Context): File {
+                  val dir = File(context.cacheDir, SHARE_CACHE_DIR)
+                  if (!dir.exists()) {
+                      dir.mkdirs()
+                  }
+                  // Prune old shared copies older than 1 hour
+                  val cutoff = System.currentTimeMillis() - 3_600_000L
+                  try {
+                      dir.listFiles()?.forEach { f ->
+                          if (f.isFile && f.lastModified() < cutoff) {
+                              f.delete()
+                          }
+                      }
+                  } catch (_: Throwable) {
+                  }
+                  return dir
+              }
+
+              private fun stripJpegLossless(src: File, dest: File): Boolean {
+                  val orientation = try {
+                      ExifInterface(src.absolutePath).getAttributeInt(
+                          ExifInterface.TAG_ORIENTATION,
+                          ExifInterface.ORIENTATION_NORMAL,
+                      )
+                  } catch (_: Throwable) {
+                      ExifInterface.ORIENTATION_NORMAL
+                  }
+
+                  BufferedInputStream(FileInputStream(src)).use { input ->
+                      BufferedOutputStream(FileOutputStream(dest)).use { output ->
+                          val b0 = input.read()
+                          val b1 = input.read()
+                          if (b0 != 0xFF || b1 != 0xD8) {
+                              return false
+                          }
+                          output.write(0xFF)
+                          output.write(0xD8)
+
+                          val buf = ByteArray(16384)
+                          while (true) {
+                              var prefix = input.read()
+                              if (prefix == -1) break
+                              if (prefix != 0xFF) {
+                                  output.write(prefix)
+                                  continue
+                              }
+                              var marker = input.read()
+                              while (marker == 0xFF) {
+                                  marker = input.read()
+                              }
+                              if (marker == -1) break
+
+                              // Start of Scan (0xDA) -> copy rest of image verbatim
+                              if (marker == 0xDA) {
+                                  output.write(0xFF)
+                                  output.write(marker)
+                                  var n = input.read(buf)
+                                  while (n != -1) {
+                                      output.write(buf, 0, n)
+                                      n = input.read(buf)
+                                  }
+                                  break
+                              }
+
+                              // Standalone markers without length (EOI, RST0-RST7, TEM)
+                              if (marker == 0xD9 || marker == 0x01 || (marker in 0xD0..0xD7)) {
+                                  output.write(0xFF)
+                                  output.write(marker)
+                                  if (marker == 0xD9) break
+                                  continue
+                              }
+
+                              val lenHi = input.read()
+                              val lenLo = input.read()
+                              if (lenHi == -1 || lenLo == -1) break
+                              val segLen = ((lenHi shl 8) or lenLo) - 2
+                              if (segLen < 0) return false
+
+                              // Drop APP1 (EXIF/XMP), APP13 (IPTC/Photoshop), COM (comments)
+                              val dropSegment = (marker == 0xE1 || marker == 0xED || marker == 0xFE)
+                              if (dropSegment) {
+                                  var remaining = segLen.toLong()
+                                  while (remaining > 0L) {
+                                      val skipped = input.skip(remaining)
+                                      if (skipped <= 0L) {
+                                          if (input.read() == -1) break
+                                          remaining -= 1L
+                                      } else {
+                                          remaining -= skipped
+                                      }
+                                  }
+                              } else {
+                                  output.write(0xFF)
+                                  output.write(marker)
+                                  output.write(lenHi)
+                                  output.write(lenLo)
+                                  var remaining = segLen
+                                  while (remaining > 0) {
+                                      val toRead = minOf(remaining, buf.size)
+                                      val read = input.read(buf, 0, toRead)
+                                      if (read == -1) break
+                                      output.write(buf, 0, read)
+                                      remaining -= read
+                                  }
+                              }
+                          }
+                      }
+                  }
+
+                  if (!dest.exists() || dest.length() == 0L) {
+                      dest.delete()
+                      return false
+                  }
+
+                  // Preserve ONLY orientation tag so rotated camera photos stay upright
+                  if (orientation != ExifInterface.ORIENTATION_NORMAL && orientation != ExifInterface.ORIENTATION_UNDEFINED) {
+                      try {
+                          val exif = ExifInterface(dest.absolutePath)
+                          exif.setAttribute(ExifInterface.TAG_ORIENTATION, orientation.toString())
+                          exif.saveAttributes()
+                      } catch (_: Throwable) {
+                      }
+                  }
+                  return true
+              }
+
+              private fun stripPngLossless(src: File, dest: File): Boolean {
+                  val expectedSig = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
+                  DataInputStream(BufferedInputStream(FileInputStream(src))).use { input ->
+                      DataOutputStream(BufferedOutputStream(FileOutputStream(dest))).use { output ->
+                          val sig = ByteArray(8)
+                          input.readFully(sig)
+                          if (!sig.contentEquals(expectedSig)) return false
+                          output.write(sig)
+
+                          val typeBytes = ByteArray(4)
+                          val buf = ByteArray(16384)
+                          while (true) {
+                              val length = try {
+                                  input.readInt()
+                              } catch (_: Throwable) {
+                                  break
+                              }
+                              if (length < 0) return false
+                              input.readFully(typeBytes)
+                              val chunkType = String(typeBytes, Charsets.US_ASCII)
+                              val keep = chunkType in PNG_KEEP_CHUNKS
+                              if (keep) {
+                                  output.writeInt(length)
+                                  output.write(typeBytes)
+                                  var rem = length
+                                  while (rem > 0) {
+                                      val n = input.read(buf, 0, minOf(rem, buf.size))
+                                      if (n == -1) return false
+                                      output.write(buf, 0, n)
+                                      rem -= n
+                                  }
+                                  val crc = input.readInt()
+                                  output.writeInt(crc)
+                              } else {
+                                  var rem = length.toLong() + 4L
+                                  while (rem > 0L) {
+                                      val skipped = input.skip(rem)
+                                      if (skipped <= 0L) {
+                                          if (input.read() == -1) break
+                                          rem -= 1L
+                                      } else {
+                                          rem -= skipped
+                                      }
+                                  }
+                              }
+                              if (chunkType == "IEND") break
+                          }
+                      }
+                  }
+                  if (!dest.exists() || dest.length() == 0L) {
+                      dest.delete()
+                      return false
+                  }
+                  return true
+              }
+
+              private fun stripToFile(src: File, dest: File): Boolean {
+                  val ext = src.name.substringAfterLast('.', "").lowercase(Locale.US)
+                  return try {
+                      when {
+                          ext in JPEG_EXTS -> stripJpegLossless(src, dest)
+                          ext in PNG_EXTS -> stripPngLossless(src, dest)
+                          else -> false
+                      }
+                  } catch (_: Throwable) {
+                      try {
+                          dest.delete()
+                      } catch (_: Throwable) {
+                      }
+                      false
+                  }
+              }
+
+              fun prepareForShareAsync(activity: Activity, paths: List<String>, onReady: (List<String>) -> Unit) {
+                  if (!isAutoStripOnShareEnabled(activity) || paths.isEmpty()) {
+                      onReady(paths)
+                      return
+                  }
+                  thread {
+                      val cacheDir = getShareCacheDir(activity)
+                      val outPaths = paths.map { origPath ->
+                          val src = File(origPath)
+                          val ext = src.name.substringAfterLast('.', "").lowercase(Locale.US)
+                          if (src.exists() && src.isFile && (ext in JPEG_EXTS || ext in PNG_EXTS)) {
+                              val cleanFile = File(cacheDir, "photo_${System.nanoTime()}.$ext")
+                              if (stripToFile(src, cleanFile)) cleanFile.absolutePath else origPath
+                          } else {
+                              origPath
+                          }
+                      }
+                      activity.runOnUiThread {
+                          onReady(outPaths)
+                      }
+                  }
+              }
+
+              fun stripInPlaceAsync(activity: Activity, paths: List<String>, onComplete: () -> Unit = {}) {
+                  if (paths.isEmpty()) return
+                  thread {
+                      var cleanedCount = 0
+                      var skippedCount = 0
+                      val scanned = mutableListOf<String>()
+                      for (path in paths) {
+                          val src = File(path)
+                          val ext = src.name.substringAfterLast('.', "").lowercase(Locale.US)
+                          if (!src.exists() || !src.isFile || (ext !in JPEG_EXTS && ext !in PNG_EXTS)) {
+                              skippedCount++
+                              continue
+                          }
+                          val tmp = File(activity.cacheDir, "strip_${System.nanoTime()}.$ext")
+                          try {
+                              if (stripToFile(src, tmp)) {
+                                  FileInputStream(tmp).use { input ->
+                                      FileOutputStream(src, false).use { output ->
+                                          input.copyTo(output)
+                                      }
+                                  }
+                                  scanned.add(src.absolutePath)
+                                  cleanedCount++
+                              } else {
+                                  skippedCount++
+                              }
+                          } catch (_: Throwable) {
+                              skippedCount++
+                          } finally {
+                              try {
+                                  tmp.delete()
+                              } catch (_: Throwable) {
+                              }
+                          }
+                      }
+                      if (scanned.isNotEmpty()) {
+                          MediaScannerConnection.scanFile(activity, scanned.toTypedArray(), null, null)
+                      }
+                      activity.runOnUiThread {
+                          val msg = when {
+                              cleanedCount > 0 && skippedCount == 0 ->
+                                  "Removed metadata from $cleanedCount ${if (cleanedCount == 1) "photo" else "photos"}"
+                              cleanedCount > 0 ->
+                                  "Removed metadata from $cleanedCount photo(s) ($skippedCount skipped)"
+                              else ->
+                                  "No supported JPEG/PNG photos to strip (grant All Files Access if needed)"
+                          }
+                          Toast.makeText(activity, msg, Toast.LENGTH_LONG).show()
+                          onComplete()
+                      }
+                  }
+              }
+          }
+          """
+              write_file(helper, content)
+              print(f"Created {helper}")
+
+          def patch_share_auto_strip() -> None:
+              act_ext = ROOT / "extensions/Activity.kt"
+              code = read_file(act_ext)
+              old_share = (
+                  "fun Activity.sharePath(path: String) {\n"
+                  "    sharePathIntent(path, BuildConfig.APPLICATION_ID)\n"
+                  "}\n"
+                  "\n"
+                  "fun Activity.sharePaths(paths: ArrayList<String>) {\n"
+                  "    sharePathsIntent(paths, BuildConfig.APPLICATION_ID)\n"
+                  "}"
+              )
+              new_share = (
+                  "fun Activity.sharePath(path: String) {\n"
+                  "    MetadataStripper.prepareForShareAsync(this, listOf(path)) { cleaned ->\n"
+                  "        sharePathIntent(cleaned.firstOrNull() ?: path, BuildConfig.APPLICATION_ID)\n"
+                  "    }\n"
+                  "}\n"
+                  "\n"
+                  "fun Activity.sharePaths(paths: ArrayList<String>) {\n"
+                  "    MetadataStripper.prepareForShareAsync(this, paths) { cleaned ->\n"
+                  "        sharePathsIntent(ArrayList(cleaned), BuildConfig.APPLICATION_ID)\n"
+                  "    }\n"
+                  "}"
+              )
+              if old_share not in code:
+                  raise RuntimeError(f"Could not locate sharePath/sharePaths in {act_ext}")
+              code = code.replace(old_share, new_share, 1)
+              code = ensure_import(code, "import org.fossify.gallery.helpers.MetadataStripper")
+              write_file(act_ext, code)
+              print(f"Patched {act_ext} (auto-strip metadata on share enabled by default)")
+
+          def patch_metadata_menus() -> None:
+              # 1. MainActivity 3-dot toggle for auto-strip on share
+              inject_menu_hook(
+                  ROOT / "activities/MainActivity.kt",
+                  "binding.mainMenu.toolbar!!.menu",
+                  991005,
+                  "Strip Metadata on Share",
+                  "MetadataStripper.toggleAutoStripOnShare(this)",
+              )
+              main_path = ROOT / "activities/MainActivity.kt"
+              write_file(main_path, ensure_import(read_file(main_path), "import org.fossify.gallery.helpers.MetadataStripper"))
+
+              # 2. ViewPagerActivity 3-dot manual Remove Metadata
+              inject_menu_hook(
+                  ROOT / "activities/ViewPagerActivity.kt",
+                  "binding.mediumViewerToolbar.menu",
+                  991006,
+                  "Remove Metadata",
+                  "getCurrentMedium()?.path?.let { p -> MetadataStripper.stripInPlaceAsync(this, listOf(p)) }",
+              )
+              vp_path = ROOT / "activities/ViewPagerActivity.kt"
+              write_file(vp_path, ensure_import(read_file(vp_path), "import org.fossify.gallery.helpers.MetadataStripper"))
+
+              # 3. MediaAdapter multi-select manual Remove Metadata
+              adapter_path = ROOT / "adapters/MediaAdapter.kt"
+              code = read_file(adapter_path)
+              marker_menu = '        menu.findItem(991004)?.isVisible = !isInRecycleBin\n'
+              if marker_menu not in code:
+                  raise RuntimeError(f"Could not locate batch menu marker in {adapter_path}")
+              add_meta = (
+                  marker_menu +
+                  '        if (menu.findItem(991007) == null) {\n'
+                  '            menu.add(0, 991007, 0, "Remove Metadata")\n'
+                  '        }\n'
+                  '        menu.findItem(991007)?.isVisible = !isInRecycleBin\n'
+              )
+              code = code.replace(marker_menu, add_meta, 1)
+
+              marker_when = '            991004 -> {\n'
+              if marker_when not in code:
+                  raise RuntimeError(f"Could not locate 991004 branch in {adapter_path}")
+              meta_branch = (
+                  '            991007 -> {\n'
+                  '                val paths = getSelectedItems().map { it.path }\n'
+                  '                MetadataStripper.stripInPlaceAsync(activity, paths) {\n'
+                  '                    finishActMode()\n'
+                  '                }\n'
+                  '            }\n'
+                  + marker_when
+              )
+              code = code.replace(marker_when, meta_branch, 1)
+              code = ensure_import(code, "import org.fossify.gallery.helpers.MetadataStripper")
+              write_file(adapter_path, code)
+              print(f"Injected Remove Metadata action into {adapter_path}")
+
           def main() -> None:
               create_properties_helper()
               create_vault_manager()
@@ -1700,6 +2108,9 @@ jobs:
               patch_vault_menus()
               patch_vault_search_triggers()
               patch_batch_vault_menu()
+              create_metadata_stripper()
+              patch_share_auto_strip()
+              patch_metadata_menus()
               print("All No-DateTime + Private Vault patches applied successfully.")
 
           if __name__ == "__main__":
