@@ -1719,6 +1719,8 @@ jobs:
           import java.io.FileInputStream
           import java.io.FileOutputStream
           import java.util.Locale
+          import java.util.concurrent.Callable
+          import java.util.concurrent.Executors
           import kotlin.concurrent.thread
 
           object MetadataStripper {
