@@ -143,6 +143,8 @@ jobs:
           import java.io.RandomAccessFile
           import java.security.MessageDigest
           import java.util.Locale
+          import java.util.concurrent.Callable
+          import java.util.concurrent.Executors
           import kotlin.concurrent.thread
 
           object VaultManager {
@@ -667,6 +669,7 @@ jobs:
           import com.alexvasilkov.gestures.GestureImageView
           import com.bumptech.glide.Glide
           import com.bumptech.glide.load.DecodeFormat
+          import com.bumptech.glide.load.engine.DiskCacheStrategy
           import com.bumptech.glide.request.RequestOptions
           import org.fossify.gallery.helpers.VaultManager
           import java.io.File
@@ -963,6 +966,7 @@ jobs:
 
                   viewPager = ViewPager2(this).apply {
                       orientation = ViewPager2.ORIENTATION_HORIZONTAL
+                      offscreenPageLimit = 1
                       layoutParams = FrameLayout.LayoutParams(
                           ViewGroup.LayoutParams.MATCH_PARENT,
                           ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1211,7 +1215,15 @@ jobs:
                       badge.visibility = if (VaultManager.isVideoFile(file)) View.VISIBLE else View.GONE
                       checkOverlay.visibility = if (isSelected) View.VISIBLE else View.GONE
                       iv.alpha = if (isSelected) 0.55f else 1.0f
-                      Glide.with(this@VaultActivity).load(file).centerCrop().into(iv)
+                      Glide.with(this@VaultActivity)
+                          .load(file)
+                          .apply(
+                              RequestOptions()
+                                  .override(size, size)
+                                  .centerCrop()
+                                  .diskCacheStrategy(DiskCacheStrategy.AUTOMATIC)
+                          )
+                          .into(iv)
                       return tile
                   }
               }
@@ -1292,13 +1304,18 @@ jobs:
                           holder.videoView.visibility = View.GONE
                           holder.playButton.visibility = View.GONE
                           holder.imageView.visibility = View.VISIBLE
+                          val previewRequest = Glide.with(this@VaultActivity)
+                              .load(file)
+                              .apply(RequestOptions().override(512).fitCenter())
                           Glide.with(this@VaultActivity)
                               .load(file)
+                              .thumbnail(previewRequest)
                               .apply(
                                   RequestOptions()
                                       .format(DecodeFormat.PREFER_ARGB_8888)
                                       .override(4096)
                                       .fitCenter()
+                                      .diskCacheStrategy(DiskCacheStrategy.RESOURCE)
                               )
                               .into(holder.imageView)
                       }
@@ -1755,8 +1772,8 @@ jobs:
                       ExifInterface.ORIENTATION_NORMAL
                   }
 
-                  BufferedInputStream(FileInputStream(src)).use { input ->
-                      BufferedOutputStream(FileOutputStream(dest)).use { output ->
+                  BufferedInputStream(FileInputStream(src), 65536).use { input ->
+                      BufferedOutputStream(FileOutputStream(dest), 65536).use { output ->
                           val b0 = input.read()
                           val b1 = input.read()
                           if (b0 != 0xFF || b1 != 0xD8) {
@@ -1765,7 +1782,7 @@ jobs:
                           output.write(0xFF)
                           output.write(0xD8)
 
-                          val buf = ByteArray(16384)
+                          val buf = ByteArray(65536)
                           while (true) {
                               var prefix = input.read()
                               if (prefix == -1) break
@@ -1855,15 +1872,15 @@ jobs:
 
               private fun stripPngLossless(src: File, dest: File): Boolean {
                   val expectedSig = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
-                  DataInputStream(BufferedInputStream(FileInputStream(src))).use { input ->
-                      DataOutputStream(BufferedOutputStream(FileOutputStream(dest))).use { output ->
+                  DataInputStream(BufferedInputStream(FileInputStream(src), 65536)).use { input ->
+                      DataOutputStream(BufferedOutputStream(FileOutputStream(dest), 65536)).use { output ->
                           val sig = ByteArray(8)
                           input.readFully(sig)
                           if (!sig.contentEquals(expectedSig)) return false
                           output.write(sig)
 
                           val typeBytes = ByteArray(4)
-                          val buf = ByteArray(16384)
+                          val buf = ByteArray(65536)
                           while (true) {
                               val length = try {
                                   input.readInt()
@@ -1933,14 +1950,42 @@ jobs:
                   }
                   thread {
                       val cacheDir = getShareCacheDir(activity)
-                      val outPaths = paths.map { origPath ->
-                          val src = File(origPath)
-                          val ext = src.name.substringAfterLast('.', "").lowercase(Locale.US)
-                          if (src.exists() && src.isFile && (ext in JPEG_EXTS || ext in PNG_EXTS)) {
-                              val cleanFile = File(cacheDir, "photo_${System.nanoTime()}.$ext")
-                              if (stripToFile(src, cleanFile)) cleanFile.absolutePath else origPath
-                          } else {
-                              origPath
+                      val outPaths = if (paths.size <= 1) {
+                          paths.map { origPath ->
+                              val src = File(origPath)
+                              val ext = src.name.substringAfterLast('.', "").lowercase(Locale.US)
+                              if (src.exists() && src.isFile && (ext in JPEG_EXTS || ext in PNG_EXTS)) {
+                                  val cleanFile = File(cacheDir, "photo_${System.nanoTime()}.$ext")
+                                  if (stripToFile(src, cleanFile)) cleanFile.absolutePath else origPath
+                              } else {
+                                  origPath
+                              }
+                          }
+                      } else {
+                          val workers = minOf(4, paths.size)
+                          val pool = Executors.newFixedThreadPool(workers)
+                          try {
+                              val tasks = paths.mapIndexed { idx, origPath ->
+                                  Callable {
+                                      val src = File(origPath)
+                                      val ext = src.name.substringAfterLast('.', "").lowercase(Locale.US)
+                                      if (src.exists() && src.isFile && (ext in JPEG_EXTS || ext in PNG_EXTS)) {
+                                          val cleanFile = File(cacheDir, "photo_${System.nanoTime()}_$idx.$ext")
+                                          if (stripToFile(src, cleanFile)) cleanFile.absolutePath else origPath
+                                      } else {
+                                          origPath
+                                      }
+                                  }
+                              }
+                              pool.invokeAll(tasks).mapIndexed { idx, fut ->
+                                  try {
+                                      fut.get()
+                                  } catch (_: Throwable) {
+                                      paths[idx]
+                                  }
+                              }
+                          } finally {
+                              pool.shutdown()
                           }
                       }
                       activity.runOnUiThread {
